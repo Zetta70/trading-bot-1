@@ -1,0 +1,446 @@
+"""
+Entry point for the KIS Trading Bot — Dual Market (KR + US).
+
+Architecture:
+  ┌──────────────────────────────────────────────────────┐
+  │                    main.py                           │
+  │  ┌──────────┐  ┌──────────┐  ┌────────────────────┐ │
+  │  │ KR Session│  │ US Session│  │  Idle Tasks        │ │
+  │  │ 08:50~    │  │ 23:30~   │  │  (model retrain,   │ │
+  │  │ 15:40 KST │  │ 06:00 KST│  │   data backup)     │ │
+  │  └──────────┘  └──────────┘  └────────────────────┘ │
+  └──────────────────────────────────────────────────────┘
+
+Scheduler (all times in KST):
+  09:00–15:30 KST  → Korean market session (KISClient)
+  15:40–23:30 KST  → Idle window: model retrain + data backup
+  23:30–06:00 KST  → US market session (KISUSClient)
+  06:00–08:50 KST  → Idle window: sleep
+
+DST handling: US market times are derived from America/New_York
+  timezone (zoneinfo), which auto-handles EST/EDT. The KST
+  equivalents shift accordingly (~23:30 or ~22:30 KST).
+"""
+
+import asyncio
+import random
+import logging
+import signal
+from datetime import datetime, timedelta
+
+from config import Config, KST, EST, MARKET_OPEN, MARKET_CLOSE, US_MARKET_OPEN, US_MARKET_CLOSE
+from logger_setup import setup_logging
+from kis_client import KISClient
+from market_scanner import MarketScanner
+from ml_predictor import MLPredictor
+from portfolio_manager import PortfolioManager
+
+logger = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Market Time Helpers
+# ═══════════════════════════════════════════════════════════════════════
+
+def is_kr_market_open() -> bool:
+    """Check if Korean market is currently open (KST)."""
+    now = datetime.now(KST)
+    if now.weekday() >= 5:
+        return False
+    open_t = now.replace(
+        hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0,
+    )
+    close_t = now.replace(
+        hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1], second=0, microsecond=0,
+    )
+    return open_t <= now <= close_t
+
+
+def is_us_market_open() -> bool:
+    """Check if US market is currently open (ET, DST-aware)."""
+    now_et = datetime.now(EST)
+    if now_et.weekday() >= 5:
+        return False
+    open_t = now_et.replace(
+        hour=US_MARKET_OPEN[0], minute=US_MARKET_OPEN[1],
+        second=0, microsecond=0,
+    )
+    close_t = now_et.replace(
+        hour=US_MARKET_CLOSE[0], minute=US_MARKET_CLOSE[1],
+        second=0, microsecond=0,
+    )
+    return open_t <= now_et <= close_t
+
+
+def next_kr_market_open() -> datetime:
+    """Return the next KR market open time as KST datetime."""
+    now = datetime.now(KST)
+    candidate = now.replace(
+        hour=MARKET_OPEN[0], minute=MARKET_OPEN[1], second=0, microsecond=0,
+    )
+    if candidate <= now:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+def next_us_market_open() -> datetime:
+    """Return the next US market open time as KST datetime."""
+    now_et = datetime.now(EST)
+    candidate = now_et.replace(
+        hour=US_MARKET_OPEN[0], minute=US_MARKET_OPEN[1],
+        second=0, microsecond=0,
+    )
+    if candidate <= now_et:
+        candidate += timedelta(days=1)
+    while candidate.weekday() >= 5:
+        candidate += timedelta(days=1)
+    # Convert to KST for unified scheduling
+    return candidate.astimezone(KST)
+
+
+def _seconds_until(target_kst: datetime) -> float:
+    """Seconds from now until a KST target time."""
+    return max(0, (target_kst - datetime.now(KST)).total_seconds())
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Session Runners
+# ═══════════════════════════════════════════════════════════════════════
+
+async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
+    """Run the Korean market trading session."""
+    if not config.tickers_kr:
+        logger.info("No KR tickers configured. Skipping KR session.")
+        return
+
+    logger.info("═" * 50)
+    logger.info("  KR SESSION START")
+    logger.info("═" * 50)
+
+    client = KISClient(
+        api_key=config.api_key,
+        api_secret=config.api_secret,
+        acc_no=config.acc_no,
+        run_mode=config.run_mode,
+    )
+
+    scanner = MarketScanner(client, mock_mode=(config.run_mode == "MOCK"))
+    predictor = MLPredictor()
+
+    bot_kwargs = {
+        "qty": 1,
+        "threshold": config.threshold,
+        "poll_interval": config.poll_interval,
+        "sma_period": config.sma_period,
+        "bullish_threshold": config.bullish_threshold,
+        "trailing_stop_pct": config.trailing_stop_pct,
+    }
+
+    portfolio = PortfolioManager(
+        client=client,
+        scanner=scanner,
+        predictor=predictor,
+        initial_cash=config.initial_cash,
+        max_drawdown_pct=config.max_drawdown_pct,
+        max_active_bots=config.max_active_bots,
+        scan_interval=config.scan_interval,
+        skip_market_hours=False,
+        bot_kwargs=bot_kwargs,
+    )
+
+    if portfolio.load_state():
+        logger.info("KR: Resumed from saved state.")
+
+    for ticker in config.tickers_kr:
+        await portfolio.add_bot(ticker)
+
+    try:
+        await portfolio.run()
+    finally:
+        await client.close()
+        logger.info("KR SESSION END")
+
+
+async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
+    """
+    Run the US market trading session.
+
+    Uses KISUSClient for order execution. The trading logic reuses
+    the same PortfolioManager/TradingBot architecture but with the
+    US client adapter.
+    """
+    if not config.tickers_us:
+        logger.info("No US tickers configured. Skipping US session.")
+        return
+
+    logger.info("═" * 50)
+    logger.info("  US SESSION START")
+    logger.info("═" * 50)
+
+    from api.kis_us_api import KISUSClient
+
+    us_client = KISUSClient(
+        api_key=config.us_api_key,
+        api_secret=config.us_api_secret,
+        acc_no=config.us_acc_no,
+        run_mode=config.run_mode,
+        default_usdkrw=config.default_usdkrw,
+    )
+
+    # Adapter: wrap KISUSClient to match the KISClient interface
+    # expected by TradingBot (get_current_price, place_order)
+    adapter = _USClientAdapter(us_client)
+
+    scanner = MarketScanner(adapter, mock_mode=True)  # US scanner = mock for now
+    predictor = MLPredictor()
+
+    us_cash = int(config.initial_cash * config.us_allocation_pct)
+    bot_kwargs = {
+        "qty": 1,
+        "threshold": config.threshold,
+        "poll_interval": config.poll_interval,
+        "sma_period": config.sma_period,
+        "bullish_threshold": config.bullish_threshold,
+        "trailing_stop_pct": config.trailing_stop_pct,
+    }
+
+    portfolio = PortfolioManager(
+        client=adapter,
+        scanner=scanner,
+        predictor=predictor,
+        initial_cash=us_cash,
+        max_drawdown_pct=config.max_drawdown_pct,
+        max_active_bots=min(len(config.tickers_us), config.max_active_bots),
+        scan_interval=config.scan_interval,
+        skip_market_hours=True,  # We handle market hours in the scheduler
+        bot_kwargs=bot_kwargs,
+    )
+
+    for ticker in config.tickers_us:
+        await portfolio.add_bot(ticker)
+
+    # Run until US market closes
+    try:
+        run_task = asyncio.create_task(portfolio.run())
+
+        while not stop_event.is_set() and is_us_market_open():
+            await asyncio.sleep(30)
+
+        portfolio.stop()
+        await asyncio.sleep(2)  # Grace period
+        if not run_task.done():
+            run_task.cancel()
+            try:
+                await run_task
+            except asyncio.CancelledError:
+                pass
+
+    finally:
+        portfolio.save_state()
+        await us_client.close()
+        logger.info("US SESSION END")
+
+
+class _USClientAdapter:
+    """
+    Adapter to make KISUSClient compatible with KISClient interface.
+
+    TradingBot expects:
+      - client.get_current_price(ticker) -> int
+      - client.place_order(ticker, qty, side, order_type) -> dict
+
+    This adapter wraps the US-specific methods to match.
+    """
+
+    def __init__(self, us_client):
+        self._us = us_client
+
+    async def get_current_price(self, ticker: str) -> int:
+        """Get US stock price, converted to a comparable integer (cents * 100)."""
+        price_usd = await self._us.get_us_price(ticker)
+        # Store as integer cents for compatibility with TradingBot's int arithmetic
+        return int(price_usd * 100)
+
+    async def place_order(
+        self,
+        ticker: str,
+        qty: int,
+        side: str,
+        order_type: str = "market",
+        price: int = 0,
+    ) -> dict:
+        """Place US order, converting price from cents back to USD."""
+        price_usd = price / 100 if price > 0 else 0
+        return await self._us.place_us_order(
+            ticker, qty, side, order_type, price_usd,
+        )
+
+    async def close(self) -> None:
+        await self._us.close()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Idle Tasks (between sessions)
+# ═══════════════════════════════════════════════════════════════════════
+
+async def run_idle_tasks(config: Config) -> None:
+    """
+    Execute maintenance tasks during the idle window between KR close and US open.
+
+    Tasks:
+      1. Model retraining (if backtest module is available)
+      2. State/log backup
+    """
+    logger.info("── Idle Window: Running maintenance tasks ──")
+
+    # Task 1: Log rotation / backup summary
+    try:
+        from pathlib import Path
+        import shutil
+        from datetime import datetime as dt
+
+        backup_dir = Path("backups") / dt.now(KST).strftime("%Y%m%d")
+        backup_dir.mkdir(parents=True, exist_ok=True)
+
+        for log_file in Path("logs").glob("*.log"):
+            dest = backup_dir / log_file.name
+            if not dest.exists():
+                shutil.copy2(log_file, dest)
+
+        state_file = Path("state.json")
+        if state_file.exists():
+            shutil.copy2(state_file, backup_dir / "state.json")
+
+        logger.info("Backup complete → %s/", backup_dir)
+    except Exception as e:
+        logger.warning("Backup failed: %s", e)
+
+    # Task 2: Model retrain hint
+    logger.info(
+        "Tip: Run 'python -m backtest.run_backtest --save-model models/lgbm_v1.pkl' "
+        "to retrain the ML model with latest data."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main Scheduler
+# ═══════════════════════════════════════════════════════════════════════
+
+async def scheduler(config: Config, stop_event: asyncio.Event) -> None:
+    """
+    Dual-market scheduler loop.
+
+    Continuously checks which market is open and runs the appropriate session.
+    During idle windows, runs maintenance tasks.
+
+    Timeline (typical non-DST day in KST):
+      08:50 ~ 15:40  →  KR session
+      15:40 ~ 23:30  →  Idle (backup, retrain)
+      23:30 ~ 06:00  →  US session
+      06:00 ~ 08:50  →  Sleep
+    """
+    idle_done_today = False
+    last_idle_date = None
+
+    while not stop_event.is_set():
+        now = datetime.now(KST)
+        today = now.date()
+
+        # ── KR market open? ──────────────────────────────────────
+        if is_kr_market_open():
+            idle_done_today = False
+            try:
+                await run_kr_session(config, stop_event)
+            except Exception as e:
+                logger.error("KR session error: %s", e)
+            continue
+
+        # ── US market open? ──────────────────────────────────────
+        if is_us_market_open():
+            try:
+                await run_us_session(config, stop_event)
+            except Exception as e:
+                logger.error("US session error: %s", e)
+            continue
+
+        # ── Idle window ──────────────────────────────────────────
+        if not idle_done_today and last_idle_date != today:
+            try:
+                await run_idle_tasks(config)
+            except Exception as e:
+                logger.warning("Idle tasks error: %s", e)
+            idle_done_today = True
+            last_idle_date = today
+
+        # ── Determine next event and sleep ───────────────────────
+        next_kr = next_kr_market_open()
+        next_us = next_us_market_open()
+        next_event = min(next_kr, next_us)
+        wait_sec = _seconds_until(next_event)
+
+        if wait_sec > 0:
+            label = "KR" if next_event == next_kr else "US"
+            logger.info(
+                "Both markets closed. Next: %s at %s (%.0f min)",
+                label,
+                next_event.strftime("%Y-%m-%d %H:%M KST"),
+                wait_sec / 60,
+            )
+            # Sleep in 5-min chunks so we can react to stop_event
+            sleep_chunk = min(wait_sec, 300)
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=sleep_chunk)
+                break  # Stop event was set
+            except asyncio.TimeoutError:
+                continue
+
+
+async def main() -> None:
+    """
+    Outer loop with auto-recovery.
+
+    On unexpected crash: log the error, wait 30–60s, restart.
+    On KeyboardInterrupt / SIGTERM: shut down cleanly.
+    """
+    setup_logging()
+
+    config = Config()
+    config.validate()
+    config.log_summary()
+
+    # Handle SIGTERM for clean shutdown in systemd / Docker
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+
+    def _signal_handler():
+        logger.info("Received shutdown signal.")
+        stop_event.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, _signal_handler)
+
+    while not stop_event.is_set():
+        try:
+            await scheduler(config, stop_event)
+            break
+        except KeyboardInterrupt:
+            logger.info("Shutdown requested (Ctrl+C).")
+            break
+        except Exception as e:
+            wait = random.uniform(30, 60)
+            logger.error(
+                "Fatal error: %s. Auto-restarting in %.0fs…", e, wait,
+            )
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=wait)
+                break
+            except asyncio.TimeoutError:
+                continue
+
+    logger.info("Goodbye.")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())

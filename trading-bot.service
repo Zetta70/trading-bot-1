@@ -1,0 +1,53 @@
+# ─────────────────────────────────────────────────────────────────────
+# systemd service template for KIS Paper Trading Bot
+#
+# Installation:
+#   1. Edit the paths below to match your deployment
+#   2. Copy to systemd:
+#        sudo cp trading-bot.service /etc/systemd/system/
+#   3. Enable and start:
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable trading-bot
+#        sudo systemctl start trading-bot
+#   4. Check status:
+#        sudo systemctl status trading-bot
+#        journalctl -u trading-bot -f
+# ─────────────────────────────────────────────────────────────────────
+
+[Unit]
+Description=KIS Paper Trading Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+
+# ── EDIT THESE PATHS ────────────────────────────────────────────────
+WorkingDirectory=/home/ubuntu/kis-paper-trading
+ExecStart=/home/ubuntu/kis-paper-trading/startup.sh
+
+# ── Restart Policy ──────────────────────────────────────────────────
+# Always restart on failure, with a 30s cooldown
+Restart=on-failure
+RestartSec=30
+
+# ── Environment ─────────────────────────────────────────────────────
+# Force Asia/Seoul timezone regardless of server locale
+Environment=TZ=Asia/Seoul
+Environment=PYTHONUNBUFFERED=1
+
+# ── Resource Limits ─────────────────────────────────────────────────
+# Prevent runaway memory usage
+MemoryMax=512M
+CPUQuota=50%
+
+# ── Logging ─────────────────────────────────────────────────────────
+# stdout/stderr → journalctl (bot also writes to logs/ directory)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=trading-bot
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,31 @@
+═══════════════════════════════════════════════════════
+  BACKTEST PERFORMANCE REPORT
+═══════════════════════════════════════════════════════
+
+── Returns ──────────────────────────────────────
+  Total Return:      28.64%
+  CAGR:              21.37%
+  Annual Volatility: 17.27%
+
+── Risk-adjusted ───────────────────────────────
+  Sharpe Ratio:      1.086
+  Sortino Ratio:     1.396
+  Max Drawdown:      -10.19%
+  MDD Duration:      83 days
+
+── Trades ──────────────────────────────────────
+  Total Trades:      79
+  Win Rate:          53.2%
+  Avg Win:           14.19%
+  Avg Loss:          -7.19%
+  Profit Factor:     2.24
+  Expectancy:        0.0417
+  Avg Holding:       22.1 days
+  Stop-Loss Exits:   30 (38.0%)
+
+── Benchmark (KOSPI) ───────────────────────────
+  Benchmark Return:  52.11%
+  Excess Return:     -23.47%
+  Information Ratio: -0.593
+
+═══════════════════════════════════════════════════════
