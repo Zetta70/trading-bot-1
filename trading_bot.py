@@ -74,6 +74,7 @@ class TradingBot:
         tax_us: float = 0.0,
         entry_mode: str = "eod",
         max_trades_per_day: int = 2,
+        currency: str = "KRW",
     ):
         self.client = client
         self.ticker = ticker
@@ -87,12 +88,19 @@ class TradingBot:
         self.commission = commission
         self.tax_kr = tax_kr
         self.tax_us = tax_us
+        self.currency = currency.upper()
+        if self.currency not in ("KRW", "USD"):
+            raise ValueError(
+                f"currency must be 'KRW' or 'USD', got {currency!r}"
+            )
 
-        # Price tracking
-        self.reference_price: int | None = None
-        self.last_price: int = 0
-        self._price_history: list[int] = []
-        self._sma_buf: collections.deque[int] = collections.deque(
+        # Price tracking. last_price/reference_price are stored in the
+        # bot's native currency (USD float for US, KRW int for KR);
+        # cash and equity are always KRW int.
+        self.reference_price: float | int | None = None
+        self.last_price: float | int = 0
+        self._price_history: list[float | int] = []
+        self._sma_buf: collections.deque = collections.deque(
             maxlen=sma_period,
         )
 
@@ -131,8 +139,39 @@ class TradingBot:
 
     @property
     def equity(self) -> int:
-        """Current equity: cash + mark-to-market position value."""
-        return self.cash + self.position * self.last_price
+        """
+        Current equity in KRW.
+
+        Position value is mark-to-market in the bot's native currency
+        (USD or KRW). For USD bots we convert to KRW using the cached
+        FX rate, falling back to default_usdkrw if the cache is stale
+        or zero.
+        """
+        if self.currency == "USD":
+            fx = self._fx_to_krw()
+            return int(self.cash + self.position * self.last_price * fx)
+        return int(self.cash + self.position * self.last_price)
+
+    def _fx_to_krw(self) -> float:
+        """
+        USD->KRW rate for currency conversion. Returns 1.0 for KRW bots.
+
+        Reads ``client._cached_usdkrw``, falls back to
+        ``client.default_usdkrw`` (and finally 1380.0) if the cache is
+        zero, missing, or non-finite.
+        """
+        if self.currency != "USD":
+            return 1.0
+        fx = getattr(self.client, "_cached_usdkrw", 0) or 0
+        if not fx or fx <= 0 or fx != fx:  # 0 / negative / NaN
+            fx = getattr(self.client, "default_usdkrw", 0) or 1380.0
+        return float(fx)
+
+    def _fmt_price(self, p) -> str:
+        """Format a price for logs (USD: 2dp, KRW: int)."""
+        if self.currency == "USD":
+            return f"{float(p):.2f}"
+        return f"{int(p):,}"
 
     def _now_str(self) -> str:
         return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -253,10 +292,10 @@ class TradingBot:
             )
             if price <= chand_stop:
                 logger.info(
-                    "[%s] CHANDELIER EXIT: price=%d <= stop=%.0f "
-                    "(peak=%d, ATR=%.1f)",
-                    self.ticker, price, chand_stop,
-                    self._highest_since_entry, current_atr,
+                    "[%s] CHANDELIER EXIT: price=%s <= stop=%.2f "
+                    "(peak=%s, ATR=%.2f)",
+                    self.ticker, self._fmt_price(price), chand_stop,
+                    self._fmt_price(self._highest_since_entry), current_atr,
                 )
                 return "SELL"
 
@@ -266,8 +305,8 @@ class TradingBot:
                 )
                 if price <= init_stop:
                     logger.info(
-                        "[%s] INITIAL STOP: price=%d <= entry_stop=%.0f",
-                        self.ticker, price, init_stop,
+                        "[%s] INITIAL STOP: price=%s <= entry_stop=%.2f",
+                        self.ticker, self._fmt_price(price), init_stop,
                     )
                     return "SELL"
 
@@ -304,9 +343,10 @@ class TradingBot:
             return None
 
         logger.info(
-            "[%s] EOD BUY SIGNAL: price=%d, breakout=%.0f, donchian=%.0f, "
-            "ATR=%.1f, ML=BUY",
-            self.ticker, price, breakout_level, donchian_high, current_atr,
+            "[%s] EOD BUY SIGNAL: price=%s, breakout=%.2f, donchian=%.2f, "
+            "ATR=%.2f, ML=BUY",
+            self.ticker, self._fmt_price(price),
+            breakout_level, donchian_high, current_atr,
         )
         self._entry_atr = current_atr
         return "BUY"
@@ -336,9 +376,11 @@ class TradingBot:
             )
             if price <= trail_price:
                 logger.info(
-                    "[%s] TRAILING STOP: %d ≤ %d (peak=%d, trail=%.1f%%)",
-                    self.ticker, price, trail_price,
-                    self._highest_since_entry,
+                    "[%s] TRAILING STOP: %s ≤ %s (peak=%s, trail=%.1f%%)",
+                    self.ticker,
+                    self._fmt_price(price),
+                    self._fmt_price(trail_price),
+                    self._fmt_price(self._highest_since_entry),
                     self.trailing_stop_pct * 100,
                 )
                 return "SELL"
@@ -347,8 +389,8 @@ class TradingBot:
         if pct >= self.threshold:
             if sma is not None and price <= sma:
                 logger.debug(
-                    "[%s] BUY suppressed: price %d ≤ SMA %.0f",
-                    self.ticker, price, sma,
+                    "[%s] BUY suppressed: price %s ≤ SMA %.2f",
+                    self.ticker, self._fmt_price(price), sma,
                 )
                 return None
             ml_signal = self._get_ml_signal()
@@ -369,8 +411,8 @@ class TradingBot:
         if pct <= -self.threshold:
             if sma is not None and price >= sma:
                 logger.debug(
-                    "[%s] SELL suppressed: price %d ≥ SMA %.0f",
-                    self.ticker, price, sma,
+                    "[%s] SELL suppressed: price %s ≥ SMA %.2f",
+                    self.ticker, self._fmt_price(price), sma,
                 )
                 return None
             logger.info(
@@ -383,7 +425,7 @@ class TradingBot:
 
     # ── Order Execution ──────────────────────────────────────────────
 
-    async def _execute(self, side: str, price: int) -> None:
+    async def _execute(self, side: str, price) -> None:
         ml_score = self.predictor.score(self._price_history)
         try:
             result = await self.client.place_order(
@@ -404,27 +446,32 @@ class TradingBot:
                         fill_price = ccld["avg_fill_price"]
                 except Exception as e:
                     logger.warning(
-                        "[%s] Fill price query failed: %s (using request price)",
+                        "[%s] Fill price query failed: %s "
+                        "(using request price)",
                         self.ticker, e,
                     )
 
-            # Update portfolio (commission on both sides; tax on sell only)
-            is_kr = self.ticker.isdigit() and len(self.ticker) == 6
-            sell_tax = self.tax_kr if is_kr else self.tax_us
+            # Update portfolio. Cost/proceeds are computed in the bot's
+            # native currency, then converted to KRW before adjusting
+            # self.cash (which is always KRW int).
+            sell_tax = self.tax_kr if self.currency == "KRW" else self.tax_us
+            fx = self._fx_to_krw()  # 1.0 for KRW bots
 
             if side == "BUY":
-                cost = int(fill_price * self.qty * (1 + self.commission))
-                self.cash -= cost
+                cost_native = fill_price * self.qty * (1 + self.commission)
+                cost_krw = int(cost_native * fx)
+                self.cash -= cost_krw
                 self.position += self.qty
                 self._highest_since_entry = fill_price
                 if not self._entry_atr:
-                    # Fallback: ~2% of price if ATR was not recorded.
                     self._entry_atr = fill_price * 0.02
             else:
-                proceeds = int(
-                    fill_price * self.qty * (1 - self.commission - sell_tax)
+                proceeds_native = (
+                    fill_price * self.qty
+                    * (1 - self.commission - sell_tax)
                 )
-                self.cash += proceeds
+                proceeds_krw = int(proceeds_native * fx)
+                self.cash += proceeds_krw
                 self.position -= self.qty
                 if self.position <= 0:
                     self._highest_since_entry = 0
@@ -433,14 +480,15 @@ class TradingBot:
             self.reference_price = fill_price
             self._trades_today += 1
 
-            # Log trade
             self._append_trade_csv(
                 side, price, fill_price, order_no, ml_score,
             )
             trade_logger.info(
-                "%s %s x%d @ %d (fill=%d) pos=%d equity=%d ML=%.3f",
-                side, self.ticker, self.qty, price, fill_price,
-                self.position, self.equity, ml_score,
+                "%s %s x%d @ %s (fill=%s, fx=%.1f) pos=%d "
+                "equity=%d KRW ML=%.3f",
+                side, self.ticker, self.qty,
+                self._fmt_price(price), self._fmt_price(fill_price),
+                fx, self.position, self.equity, ml_score,
             )
 
         except Exception as e:
@@ -449,7 +497,7 @@ class TradingBot:
     # ── CSV Logging ──────────────────────────────────────────────────
 
     def _append_trade_csv(
-        self, side: str, price: int, fill_price: int,
+        self, side: str, price, fill_price,
         order_no: str, ml_score: float,
     ) -> None:
         row = [
@@ -459,7 +507,7 @@ class TradingBot:
         with open(TRADE_LOG, "a", newline="") as f:
             csv.writer(f).writerow(row)
 
-    def _append_equity_csv(self, price: int) -> None:
+    def _append_equity_csv(self, price) -> None:
         row = [self._now_str(), self.ticker, price, self.equity]
         with open(EQUITY_LOG, "a", newline="") as f:
             csv.writer(f).writerow(row)
@@ -489,7 +537,10 @@ class TradingBot:
             self.last_price = price
             self._price_history.append(price)
             self._sma_buf.append(price)
-            logger.info("[%s] Initial price: %d", self.ticker, price)
+            logger.info(
+                "[%s] Initial price: %s %s",
+                self.ticker, self._fmt_price(price), self.currency,
+            )
         except Exception as e:
             logger.error("[%s] Failed to start: %s", self.ticker, e)
             return

@@ -160,6 +160,7 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
         "tax_us": 0.0,
         "entry_mode": config.entry_mode,
         "max_trades_per_day": config.max_trades_per_day,
+        "currency": "KRW",
     }
 
     portfolio = PortfolioManager(
@@ -233,6 +234,7 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
         "tax_us": 0.0,
         "entry_mode": config.entry_mode,
         "max_trades_per_day": config.max_trades_per_day,
+        "currency": "USD",
     }
 
     portfolio = PortfolioManager(
@@ -274,23 +276,32 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
 
 class _USClientAdapter:
     """
-    Adapter to make KISUSClient compatible with KISClient interface.
+    Adapter exposing the KISUSClient via the KISClient interface.
 
-    TradingBot expects:
-      - client.get_current_price(ticker) -> int
-      - client.place_order(ticker, qty, side, order_type) -> dict
-
-    This adapter wraps the US-specific methods to match.
+    Currency contract (Patch 1)
+    ---------------------------
+    The bot is currency-aware: ``get_current_price`` and
+    ``get_order_fill["avg_fill_price"]`` return raw USD floats. The
+    adapter no longer multiplies prices by 100 — the bot's
+    ``self._fx_to_krw()`` now handles all currency conversion. The
+    adapter forwards ``_cached_usdkrw`` and ``default_usdkrw`` so the
+    bot can read FX rate without knowing the underlying client class.
     """
 
     def __init__(self, us_client):
         self._us = us_client
 
-    async def get_current_price(self, ticker: str) -> int:
-        """Get US stock price, converted to a comparable integer (cents * 100)."""
-        price_usd = await self._us.get_us_price(ticker)
-        # Store as integer cents for compatibility with TradingBot's int arithmetic
-        return int(price_usd * 100)
+    @property
+    def _cached_usdkrw(self) -> float:
+        return self._us._cached_usdkrw
+
+    @property
+    def default_usdkrw(self) -> float:
+        return self._us.default_usdkrw
+
+    async def get_current_price(self, ticker: str) -> float:
+        """Return the latest USD price as a float."""
+        return float(await self._us.get_us_price(ticker))
 
     async def place_order(
         self,
@@ -298,22 +309,16 @@ class _USClientAdapter:
         qty: int,
         side: str,
         order_type: str = "market",
-        price: int = 0,
+        price: float = 0,
     ) -> dict:
-        """Place US order, converting price from cents back to USD."""
-        price_usd = price / 100 if price > 0 else 0
+        """Place US order. ``price`` is USD (0 for market orders)."""
         return await self._us.place_us_order(
-            ticker, qty, side, order_type, price_usd,
+            ticker, qty, side, order_type, float(price),
         )
 
     async def get_order_fill(self, order_no: str) -> dict:
-        """Proxy to KISUSClient. Returned price is in USD cents (int)."""
-        ccld = await self._us.get_order_fill(order_no)
-        # KISUSClient returns USD-denominated price; multiply by 100 to
-        # match TradingBot's int-cents convention. Stub returns 0 → 0.
-        if ccld.get("avg_fill_price", 0) > 0:
-            ccld["avg_fill_price"] = int(ccld["avg_fill_price"] * 100)
-        return ccld
+        """Proxy to KISUSClient. Returns USD float ``avg_fill_price``."""
+        return await self._us.get_order_fill(order_no)
 
     async def close(self) -> None:
         await self._us.close()
