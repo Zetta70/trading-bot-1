@@ -15,11 +15,13 @@ import asyncio
 import collections
 import csv
 import logging
+import time
 from datetime import datetime
 from pathlib import Path
 
 from config import KST
 from ml_predictor import MLPredictor
+from ohlcv_cache import get_cache
 
 logger = logging.getLogger(__name__)
 trade_logger = logging.getLogger("trade")
@@ -67,6 +69,11 @@ class TradingBot:
         bullish_threshold: float = 0.75,
         trailing_stop_pct: float = 0.02,
         initial_cash: int = 3_000_000,
+        commission: float = 0.00015,
+        tax_kr: float = 0.0023,
+        tax_us: float = 0.0,
+        entry_mode: str = "eod",
+        max_trades_per_day: int = 2,
     ):
         self.client = client
         self.ticker = ticker
@@ -77,6 +84,9 @@ class TradingBot:
         self.sma_period = sma_period
         self.bullish_threshold = bullish_threshold
         self.trailing_stop_pct = trailing_stop_pct
+        self.commission = commission
+        self.tax_kr = tax_kr
+        self.tax_us = tax_us
 
         # Price tracking
         self.reference_price: int | None = None
@@ -91,7 +101,31 @@ class TradingBot:
         self.position: int = 0
         self._highest_since_entry: int = 0
 
+        # Daily-OHLCV ML gate state
+        self._ohlcv_cache = get_cache()
+        self._last_ml_check: float = 0.0
+        self._cached_ml_signal: str = "HOLD"
+
+        # Adaptive-threshold (Phase 1 EOD) state
+        self.atr_period = 14
+        self.pt_atr_mult = 2.0
+        self.sl_atr_mult = 1.0
+        self.chandelier_mult = 3.0
+        self.breakout_atr_mult = 1.5
+        self.entry_mode = entry_mode
+        self.max_trades_per_day = max_trades_per_day
+        self.min_holding_bars = 1
+        self._trades_today = 0
+        self._today_date: str = ""
+        self._entry_bar_idx: int | None = None
+        self._daily_ohlcv = None
+        self._last_daily_refresh: float = 0.0
+        self._entry_atr: float = 0.0
+
         self._running = False
+
+    ML_CHECK_INTERVAL = 3600  # seconds between daily-OHLCV ML re-evaluations
+    DAILY_REFRESH_INTERVAL = 3600  # seconds between daily OHLCV/indicator refresh
 
     # ── Properties ───────────────────────────────────────────────────
 
@@ -110,6 +144,173 @@ class TradingBot:
             return None
         return sum(self._sma_buf) / len(self._sma_buf)
 
+    # ── ML Gate (daily OHLCV) ────────────────────────────────────────
+
+    def _get_ml_signal(self) -> str:
+        """
+        Get ML signal based on daily OHLCV, cached for ML_CHECK_INTERVAL seconds.
+
+        Returns 'BUY', 'SELL', or 'HOLD'. Falls back to 'HOLD' on any error
+        so trades never depend on a silent inference failure.
+        """
+        now = time.time()
+        if now - self._last_ml_check < self.ML_CHECK_INTERVAL:
+            return self._cached_ml_signal
+
+        ohlcv = self._ohlcv_cache.get(self.ticker)
+        if ohlcv is None or len(ohlcv) < 60:
+            self._cached_ml_signal = "HOLD"
+        else:
+            try:
+                self._cached_ml_signal = self.predictor.predict_signal(ohlcv)
+            except Exception as e:
+                logger.warning("[%s] ML signal error: %s", self.ticker, e)
+                self._cached_ml_signal = "HOLD"
+
+        self._last_ml_check = now
+        logger.info(
+            "[%s] ML signal refreshed: %s",
+            self.ticker, self._cached_ml_signal,
+        )
+        return self._cached_ml_signal
+
+    # ── Daily-bar EOD state ──────────────────────────────────────────
+
+    def _refresh_daily_data(self) -> None:
+        """Reload daily OHLCV from cache and attach ATR/Donchian/breakout."""
+        now = time.time()
+        if now - self._last_daily_refresh < self.DAILY_REFRESH_INTERVAL:
+            return
+
+        from indicators import atr, donchian_channel, adaptive_breakout_level
+
+        df = self._ohlcv_cache.get(self.ticker)
+        if df is None or len(df) < 60:
+            logger.warning(
+                "[%s] insufficient daily data for indicators", self.ticker,
+            )
+            return
+
+        df = df.copy()
+        df["atr_14"] = atr(df, self.atr_period)
+        df["donchian_high"], df["donchian_low"] = donchian_channel(df, 20)
+        df["breakout_level"] = adaptive_breakout_level(
+            df, self.breakout_atr_mult, self.atr_period,
+        )
+        self._daily_ohlcv = df
+        self._last_daily_refresh = now
+
+    def _is_eod_window(self) -> bool:
+        """True if we are in the last 15 minutes before market close."""
+        from config import MARKET_CLOSE
+        now = datetime.now(KST)
+        close_t = now.replace(
+            hour=MARKET_CLOSE[0], minute=MARKET_CLOSE[1],
+            second=0, microsecond=0,
+        )
+        minutes_to_close = (close_t - now).total_seconds() / 60
+        return 0 < minutes_to_close <= 15
+
+    def _reset_daily_counter(self) -> None:
+        """Reset trade counter at the start of each trading day."""
+        today = datetime.now(KST).strftime("%Y-%m-%d")
+        if today != self._today_date:
+            self._today_date = today
+            self._trades_today = 0
+            logger.info("[%s] New trading day: %s", self.ticker, today)
+
+    def _evaluate_eod(self, price: int) -> str | None:
+        """
+        End-of-day evaluation using daily OHLCV + ATR-based rules.
+
+        Entry (all must pass):
+          1. price >= adaptive breakout level OR price > Donchian(20) high
+          2. ML signal == BUY
+          3. ATR/price < 5% (volatility cap)
+          4. trade count < max_trades_per_day
+
+        Exit (any triggers):
+          1. Chandelier stop: price <= peak - 3*ATR
+          2. Initial stop:    price <= entry - 1*ATR_at_entry
+          3. ML signal == SELL
+        """
+        self._refresh_daily_data()
+        self._reset_daily_counter()
+
+        if self._daily_ohlcv is None or len(self._daily_ohlcv) < 30:
+            return None
+
+        latest = self._daily_ohlcv.iloc[-1]
+        current_atr = float(latest["atr_14"])
+        if not (current_atr > 0):
+            return None
+
+        # Exit path has priority over entry.
+        if self.position > 0:
+            self._highest_since_entry = max(self._highest_since_entry, price)
+            chand_stop = (
+                self._highest_since_entry - self.chandelier_mult * current_atr
+            )
+            if price <= chand_stop:
+                logger.info(
+                    "[%s] CHANDELIER EXIT: price=%d <= stop=%.0f "
+                    "(peak=%d, ATR=%.1f)",
+                    self.ticker, price, chand_stop,
+                    self._highest_since_entry, current_atr,
+                )
+                return "SELL"
+
+            if self._entry_atr > 0 and self.reference_price is not None:
+                init_stop = (
+                    self.reference_price - self.sl_atr_mult * self._entry_atr
+                )
+                if price <= init_stop:
+                    logger.info(
+                        "[%s] INITIAL STOP: price=%d <= entry_stop=%.0f",
+                        self.ticker, price, init_stop,
+                    )
+                    return "SELL"
+
+            ml_signal = self._get_ml_signal()
+            if ml_signal == "SELL":
+                logger.info("[%s] ML SELL signal", self.ticker)
+                return "SELL"
+
+            return None
+
+        # Entry path
+        if self._trades_today >= self.max_trades_per_day:
+            return None
+
+        if current_atr / price > 0.05:
+            logger.debug(
+                "[%s] Entry skipped: ATR/price=%.3f too high",
+                self.ticker, current_atr / price,
+            )
+            return None
+
+        breakout_level = float(latest["breakout_level"])
+        donchian_high = float(latest["donchian_high"])
+        breakout = (price >= breakout_level) or (price > donchian_high)
+        if not breakout:
+            return None
+
+        ml_signal = self._get_ml_signal()
+        if ml_signal != "BUY":
+            logger.debug(
+                "[%s] Entry blocked by ML (signal=%s)",
+                self.ticker, ml_signal,
+            )
+            return None
+
+        logger.info(
+            "[%s] EOD BUY SIGNAL: price=%d, breakout=%.0f, donchian=%.0f, "
+            "ATR=%.1f, ML=BUY",
+            self.ticker, price, breakout_level, donchian_high, current_atr,
+        )
+        self._entry_atr = current_atr
+        return "BUY"
+
     # ── Signal Evaluation ────────────────────────────────────────────
 
     def _evaluate(self, price: int) -> str | None:
@@ -123,9 +324,9 @@ class TradingBot:
 
         pct = (price - self.reference_price) / self.reference_price
         sma = self._get_sma()
-        ml_score = self.predictor.score(self._price_history)
 
         # ── Trailing stop for open long positions ────────────────
+        # Risk management runs independently of the ML gate.
         if self.position > 0:
             self._highest_since_entry = max(
                 self._highest_since_entry, price,
@@ -150,16 +351,17 @@ class TradingBot:
                     self.ticker, price, sma,
                 )
                 return None
-            if ml_score < self.bullish_threshold:
-                logger.info(
-                    "[%s] BUY suppressed: ML %.3f < %.3f",
-                    self.ticker, ml_score, self.bullish_threshold,
+            ml_signal = self._get_ml_signal()
+            if ml_signal != "BUY":
+                logger.debug(
+                    "[%s] BUY blocked by ML gate (signal=%s)",
+                    self.ticker, ml_signal,
                 )
                 return None
             sma_str = f"{sma:,.0f}" if sma else "warmup"
             logger.info(
-                "[%s] BUY SIGNAL: +%.2f%%, SMA=%s, ML=%.3f",
-                self.ticker, pct * 100, sma_str, ml_score,
+                "[%s] BUY SIGNAL: +%.2f%%, SMA=%s, ML=BUY",
+                self.ticker, pct * 100, sma_str,
             )
             return "BUY"
 
@@ -190,20 +392,46 @@ class TradingBot:
             )
             output = result.get("output", {})
             order_no = output.get("ODNO", "N/A")
-            fill_price = int(output.get("fill_price", str(price)))
 
-            # Update portfolio
+            # KIS order response does not include the actual fill price.
+            # Poll the fill-query endpoint so slippage is reflected in logs.
+            fill_price = price
+            if order_no != "N/A" and hasattr(self.client, "get_order_fill"):
+                await asyncio.sleep(0.5)
+                try:
+                    ccld = await self.client.get_order_fill(order_no)
+                    if ccld.get("avg_fill_price", 0) > 0:
+                        fill_price = ccld["avg_fill_price"]
+                except Exception as e:
+                    logger.warning(
+                        "[%s] Fill price query failed: %s (using request price)",
+                        self.ticker, e,
+                    )
+
+            # Update portfolio (commission on both sides; tax on sell only)
+            is_kr = self.ticker.isdigit() and len(self.ticker) == 6
+            sell_tax = self.tax_kr if is_kr else self.tax_us
+
             if side == "BUY":
-                self.cash -= fill_price * self.qty
+                cost = int(fill_price * self.qty * (1 + self.commission))
+                self.cash -= cost
                 self.position += self.qty
-                self._highest_since_entry = price
+                self._highest_since_entry = fill_price
+                if not self._entry_atr:
+                    # Fallback: ~2% of price if ATR was not recorded.
+                    self._entry_atr = fill_price * 0.02
             else:
-                self.cash += fill_price * self.qty
+                proceeds = int(
+                    fill_price * self.qty * (1 - self.commission - sell_tax)
+                )
+                self.cash += proceeds
                 self.position -= self.qty
                 if self.position <= 0:
                     self._highest_since_entry = 0
+                    self._entry_atr = 0.0
 
             self.reference_price = fill_price
+            self._trades_today += 1
 
             # Log trade
             self._append_trade_csv(
@@ -240,30 +468,36 @@ class TradingBot:
 
     async def run(self) -> None:
         """
-        Async main loop: poll → evaluate → execute → log → sleep.
+        Async main loop.
 
+        In EOD mode (default): poll slowly and only evaluate/trade during
+        the last 15 minutes before market close. In intraday mode (legacy):
+        10-second polling with momentum threshold — backward compat only.
         Runs until .stop() is called or the task is cancelled.
         """
         self._running = True
         logger.info(
-            "[%s] Bot started (qty=%d, threshold=%.2f%%, "
-            "sma=%d, trail=%.1f%%, cash=%s)",
-            self.ticker, self.qty, self.threshold * 100,
-            self.sma_period, self.trailing_stop_pct * 100,
+            "[%s] Bot started (mode=%s, max_trades/day=%d, cash=%s)",
+            self.ticker, self.entry_mode, self.max_trades_per_day,
             f"{self.cash:,}",
         )
 
-        # Initial price
+        # Initial price fetch
         try:
             price = await self.client.get_current_price(self.ticker)
             self.reference_price = price
             self.last_price = price
             self._price_history.append(price)
             self._sma_buf.append(price)
-            logger.info("[%s] Initial price: %d KRW", self.ticker, price)
+            logger.info("[%s] Initial price: %d", self.ticker, price)
         except Exception as e:
             logger.error("[%s] Failed to start: %s", self.ticker, e)
             return
+
+        # EOD mode polls slowly — the signal only runs in the 15-min window.
+        effective_interval = (
+            60 if self.entry_mode == "eod" else self.poll_interval
+        )
 
         while self._running:
             try:
@@ -272,9 +506,15 @@ class TradingBot:
                 self._price_history.append(price)
                 self._sma_buf.append(price)
 
-                signal = self._evaluate(price)
-                if signal:
-                    await self._execute(signal, price)
+                if self.entry_mode == "eod":
+                    if self._is_eod_window():
+                        signal = self._evaluate_eod(price)
+                        if signal:
+                            await self._execute(signal, price)
+                else:
+                    signal = self._evaluate(price)
+                    if signal:
+                        await self._execute(signal, price)
 
                 self._append_equity_csv(price)
 
@@ -284,7 +524,7 @@ class TradingBot:
                 logger.error("[%s] Poll error: %s", self.ticker, e)
 
             try:
-                await asyncio.sleep(self.poll_interval)
+                await asyncio.sleep(effective_interval)
             except asyncio.CancelledError:
                 break
 

@@ -6,7 +6,7 @@ Usage
     python -m backtest.run_backtest \\
         --start 2019-01-01 --end 2024-12-31 \\
         --tickers 005930,000660,035420 \\
-        --horizon 5 --threshold 0.02
+        --horizon 10 --pt-atr-mult 2.0 --sl-atr-mult 1.0
 
 All parameters default to .env values (via config.py).
 CLI arguments override .env when explicitly provided.
@@ -27,7 +27,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from config import Config
-from backtest.data_loader import load_ohlcv, load_kospi
+from backtest.data_loader import load_ohlcv, load_kospi, load_vkospi
 from backtest.simulator import TradingSimulator
 from backtest.walk_forward import WalkForwardBacktest
 from backtest.metrics import compute_metrics, format_metrics
@@ -62,8 +62,12 @@ def parse_args(cfg: Config) -> argparse.Namespace:
         help=f"Target horizon in trading days. Default from .env: {cfg.bt_horizon}",
     )
     parser.add_argument(
-        "--threshold", type=float, default=cfg.bt_target_threshold,
-        help=f"Return threshold for target label. Default from .env: {cfg.bt_target_threshold}",
+        "--pt-atr-mult", type=float, default=cfg.bt_pt_atr_mult,
+        help=f"Profit-target ATR multiplier (triple barrier). Default: {cfg.bt_pt_atr_mult}",
+    )
+    parser.add_argument(
+        "--sl-atr-mult", type=float, default=cfg.bt_sl_atr_mult,
+        help=f"Stop-loss ATR multiplier (triple barrier). Default: {cfg.bt_sl_atr_mult}",
     )
     parser.add_argument(
         "--train-window", type=int, default=cfg.bt_train_window,
@@ -116,7 +120,8 @@ def _log_parameters(args: argparse.Namespace, tickers: list[str]) -> None:
     logger.info("  Train Window:      %d days", args.train_window)
     logger.info("  Test Window:       %d days", args.test_window)
     logger.info("  Horizon:           %d days", args.horizon)
-    logger.info("  Target Threshold:  %.4f (%.2f%%)", args.threshold, args.threshold * 100)
+    logger.info("  PT ATR mult:       %.2f", args.pt_atr_mult)
+    logger.info("  SL ATR mult:       %.2f", args.sl_atr_mult)
     logger.info("  ── Simulator ──")
     logger.info("  ML Threshold BUY:  %.4f", args.threshold_buy)
     logger.info("  ML Threshold SELL: %.4f", args.threshold_sell)
@@ -162,6 +167,16 @@ def main() -> None:
         logger.warning("Failed to load KOSPI index: %s. Continuing without.", e)
         index_df = None
 
+    vol_index_df = None
+    if cfg.use_vol_index:
+        try:
+            vol_index_df = load_vkospi(args.start, args.end)
+            if vol_index_df.empty:
+                vol_index_df = None
+        except Exception as e:
+            logger.warning("Failed to load VKOSPI: %s. Continuing without.", e)
+            vol_index_df = None
+
     # ── Configure simulator with .env values ─────────────────────
     simulator = TradingSimulator(
         initial_capital=args.initial_capital,
@@ -176,11 +191,16 @@ def main() -> None:
         train_window=args.train_window,
         test_window=args.test_window,
         horizon=args.horizon,
-        target_threshold=args.threshold,
+        pt_atr_mult=args.pt_atr_mult,
+        sl_atr_mult=args.sl_atr_mult,
         purge_days=args.horizon + 1,
+        use_ensemble=cfg.use_ensemble,
+        use_meta_labeling=cfg.use_meta_labeling,
     )
 
-    results = engine.run(ticker_ohlcv, index_df, simulator)
+    results = engine.run(
+        ticker_ohlcv, index_df, simulator, vol_index_df=vol_index_df,
+    )
     sim: TradingSimulator = results["simulator"]
 
     # ── Output results ───────────────────────────────────────────
@@ -226,42 +246,86 @@ def main() -> None:
 
     # ── Save model (optional) ────────────────────────────────────
     if args.save_model:
-        # Re-train on ALL data for deployment
         logger.info("Re-training on full dataset for deployment...")
         from features import add_features, feature_columns
-        from model import StockPredictor, make_target
-        from sklearn.preprocessing import StandardScaler
+        from model import (
+            StockPredictor, EnsemblePredictor, MetaLabeler,
+            make_target, make_primary_label, make_meta_label,
+        )
 
-        all_X, all_y = [], []
         has_market = index_df is not None
-        feat_cols = feature_columns(include_market=has_market)
+        has_vol_index = vol_index_df is not None and not vol_index_df.empty
+        feat_cols = feature_columns(
+            include_market=has_market,
+            include_regime=True,
+            include_vol_index=has_vol_index,
+        )
+
+        all_X: list[pd.DataFrame] = []
+        all_y: list[pd.Series] = []
+        all_yp: list[pd.Series] = []
+        all_ym: list[pd.Series] = []
 
         for ticker, ohlcv in ticker_ohlcv.items():
-            feat = add_features(ohlcv, index_df)
-            tgt = make_target(ohlcv, horizon=args.horizon, threshold=args.threshold)
+            feat = add_features(ohlcv, index_df, vol_index_df)
             available = [c for c in feat_cols if c in feat.columns]
-            combined = feat[available].join(tgt).dropna()
-            if len(combined) > 0:
-                all_X.append(combined[available])
-                all_y.append(combined["target"])
+
+            if cfg.use_meta_labeling:
+                yp = make_primary_label(
+                    ohlcv, horizon=args.horizon,
+                    pt_atr_mult=args.pt_atr_mult,
+                    sl_atr_mult=args.sl_atr_mult,
+                ).rename("y_primary")
+                ym = make_meta_label(
+                    ohlcv, horizon=args.horizon,
+                    pt_atr_mult=args.pt_atr_mult,
+                    sl_atr_mult=args.sl_atr_mult,
+                ).rename("y_meta")
+                combined = feat[available].join(yp).join(ym).dropna()
+                if len(combined) > 0:
+                    all_X.append(combined[available])
+                    all_yp.append(combined["y_primary"])
+                    all_ym.append(combined["y_meta"])
+            else:
+                tgt = make_target(
+                    ohlcv, horizon=args.horizon,
+                    pt_atr_mult=args.pt_atr_mult,
+                    sl_atr_mult=args.sl_atr_mult,
+                )
+                combined = feat[available].join(tgt).dropna()
+                if len(combined) > 0:
+                    all_X.append(combined[available])
+                    all_y.append(combined["target"])
 
         if all_X:
             X_full = pd.concat(all_X)
-            y_full = pd.concat(all_y)
+            val_size = max(1, int(len(X_full) * 0.1))
 
-            scaler = StandardScaler()
-            X_scaled = pd.DataFrame(
-                scaler.fit_transform(X_full),
-                columns=X_full.columns,
-                index=X_full.index,
-            )
+            if cfg.use_meta_labeling:
+                yp_full = pd.concat(all_yp)
+                ym_full = pd.concat(all_ym)
+                model = MetaLabeler()
+                model.train(
+                    X_full.iloc[:-val_size], yp_full.iloc[:-val_size],
+                    ym_full.iloc[:-val_size],
+                    X_full.iloc[-val_size:], yp_full.iloc[-val_size:],
+                    ym_full.iloc[-val_size:],
+                )
+            elif cfg.use_ensemble:
+                y_full = pd.concat(all_y)
+                model = EnsemblePredictor(task="classification")
+                model.train(
+                    X_full.iloc[:-val_size], y_full.iloc[:-val_size],
+                    X_full.iloc[-val_size:], y_full.iloc[-val_size:],
+                )
+            else:
+                y_full = pd.concat(all_y)
+                model = StockPredictor(task="classification")
+                model.train(
+                    X_full.iloc[:-val_size], y_full.iloc[:-val_size],
+                    X_full.iloc[-val_size:], y_full.iloc[-val_size:],
+                )
 
-            val_size = max(1, int(len(X_scaled) * 0.1))
-            model = StockPredictor(task="classification")
-            model.train(
-                X_scaled.iloc[:-val_size], y_full.iloc[:-val_size],
-                X_scaled.iloc[-val_size:], y_full.iloc[-val_size:],
-            )
             model.save(args.save_model)
             logger.info("Model saved to %s", args.save_model)
 

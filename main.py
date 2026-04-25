@@ -27,11 +27,12 @@ import random
 import logging
 import signal
 from datetime import datetime, timedelta
+from pathlib import Path
 
 from config import Config, KST, EST, MARKET_OPEN, MARKET_CLOSE, US_MARKET_OPEN, US_MARKET_CLOSE
 from logger_setup import setup_logging
 from kis_client import KISClient
-from market_scanner import MarketScanner
+from market_scanner import MarketScanner, CrossSectionalScanner
 from ml_predictor import MLPredictor
 from portfolio_manager import PortfolioManager
 
@@ -126,8 +127,26 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
         run_mode=config.run_mode,
     )
 
-    scanner = MarketScanner(client, mock_mode=(config.run_mode == "MOCK"))
-    predictor = MLPredictor()
+    predictor = MLPredictor.from_config(config)
+
+    if config.use_cross_sectional_scanner:
+        def _load_kr_universe():
+            import csv as _csv
+            path = Path("data/universe_kr.csv")
+            if path.exists():
+                with open(path, newline="", encoding="utf-8") as f:
+                    return [row["ticker"] for row in _csv.DictReader(f)]
+            return config.tickers_kr
+
+        scanner = CrossSectionalScanner(
+            predictor=predictor,
+            universe_loader=_load_kr_universe,
+            top_n=config.cs_scanner_top_n,
+        )
+    else:
+        scanner = MarketScanner(
+            client, mock_mode=(config.run_mode == "MOCK"),
+        )
 
     bot_kwargs = {
         "qty": 1,
@@ -136,6 +155,11 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
         "sma_period": config.sma_period,
         "bullish_threshold": config.bullish_threshold,
         "trailing_stop_pct": config.trailing_stop_pct,
+        "commission": 0.00015,
+        "tax_kr": 0.0023,
+        "tax_us": 0.0,
+        "entry_mode": config.entry_mode,
+        "max_trades_per_day": config.max_trades_per_day,
     }
 
     portfolio = PortfolioManager(
@@ -194,7 +218,7 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
     adapter = _USClientAdapter(us_client)
 
     scanner = MarketScanner(adapter, mock_mode=True)  # US scanner = mock for now
-    predictor = MLPredictor()
+    predictor = MLPredictor.from_config(config)
 
     us_cash = int(config.initial_cash * config.us_allocation_pct)
     bot_kwargs = {
@@ -204,6 +228,11 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
         "sma_period": config.sma_period,
         "bullish_threshold": config.bullish_threshold,
         "trailing_stop_pct": config.trailing_stop_pct,
+        "commission": 0.00015,
+        "tax_kr": 0.0023,
+        "tax_us": 0.0,
+        "entry_mode": config.entry_mode,
+        "max_trades_per_day": config.max_trades_per_day,
     }
 
     portfolio = PortfolioManager(
@@ -276,6 +305,15 @@ class _USClientAdapter:
         return await self._us.place_us_order(
             ticker, qty, side, order_type, price_usd,
         )
+
+    async def get_order_fill(self, order_no: str) -> dict:
+        """Proxy to KISUSClient. Returned price is in USD cents (int)."""
+        ccld = await self._us.get_order_fill(order_no)
+        # KISUSClient returns USD-denominated price; multiply by 100 to
+        # match TradingBot's int-cents convention. Stub returns 0 → 0.
+        if ccld.get("avg_fill_price", 0) > 0:
+            ccld["avg_fill_price"] = int(ccld["avg_fill_price"] * 100)
+        return ccld
 
     async def close(self) -> None:
         await self._us.close()

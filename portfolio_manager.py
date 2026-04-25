@@ -14,12 +14,14 @@ import asyncio
 import csv
 import json
 import logging
+import os
 from datetime import datetime, timedelta
 from pathlib import Path
 
 from config import KST, MARKET_OPEN, MARKET_CLOSE
 from market_scanner import MarketScanner
 from ml_predictor import MLPredictor
+from risk_manager import RiskManager
 from trading_bot import TradingBot, EQUITY_LOG, EQUITY_HEADER
 
 logger = logging.getLogger(__name__)
@@ -72,6 +74,29 @@ class PortfolioManager:
         self.bots: dict[str, TradingBot] = {}
         self._tasks: dict[str, asyncio.Task] = {}
 
+        # Phase 3: portfolio-level risk controller
+        self.risk_manager = RiskManager(
+            max_sector_exposure=float(os.getenv("MAX_SECTOR_EXPOSURE", "0.30")),
+            portfolio_stop_loss=float(os.getenv("PORTFOLIO_STOP", "-0.05")),
+            portfolio_kill=float(os.getenv("PORTFOLIO_KILL", "-0.10")),
+        )
+        self._load_sector_mapping()
+        self._last_equity_for_return: int = initial_cash
+
+    def _load_sector_mapping(self) -> None:
+        path = Path("data/sector_map_kr.csv")
+        if not path.exists():
+            logger.info("No sector_map_kr.csv found; sector limits disabled")
+            return
+        import csv as _csv
+        with open(path, newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                self.risk_manager.register_sector(row["ticker"], row["sector"])
+        logger.info(
+            "Loaded sector mapping for %d tickers",
+            len(self.risk_manager._sector_map),
+        )
+
     # ── Equity ───────────────────────────────────────────────────────
 
     @property
@@ -92,6 +117,41 @@ class PortfolioManager:
         if len(self.bots) >= self.max_active_bots:
             logger.warning("Max bots (%d) reached. Skipping %s.",
                            self.max_active_bots, ticker)
+            return False
+
+        # Phase 3: Sector exposure check
+        current_positions = {
+            t: bot.position * bot.last_price for t, bot in self.bots.items()
+        }
+        if not self.risk_manager.check_sector_concurrence(
+            ticker, current_positions, self.total_equity,
+        ):
+            logger.warning(
+                "[%s] Rejected: sector exposure would exceed %.0f%%",
+                ticker, self.risk_manager.max_sector_exposure * 100,
+            )
+            return False
+
+        # Phase 3: VaR breach check
+        if self.risk_manager.is_var_breached():
+            logger.warning(
+                "[%s] Rejected: portfolio VaR limit breached", ticker,
+            )
+            return False
+
+        # Phase 3: Deployment scale check (drawdown-based)
+        if self._peak_equity > 0:
+            dd = (self.total_equity - self._peak_equity) / self._peak_equity
+        else:
+            dd = 0.0
+        scale = self.risk_manager.compute_deployment_scale(
+            current_vol_index=None,
+            current_drawdown=dd,
+        )
+        if scale <= 0:
+            logger.critical(
+                "Deployment scale = 0 — rejecting all new positions"
+            )
             return False
 
         alloc = min(self._cash_per_bot(), self._remaining_cash)
@@ -250,32 +310,57 @@ class PortfolioManager:
 
             try:
                 candidates = await self.scanner.scan()
+                from ohlcv_cache import get_cache
+                cache = get_cache()
+
                 for cand in candidates:
                     ticker = cand["ticker"]
                     if ticker in self.bots:
                         continue
 
-                    # Quick ML pre-screen: get a few prices to score
-                    prices = []
-                    for _ in range(MLPredictor.MIN_DATA + 2):
-                        p = await self.client.get_current_price(ticker)
-                        prices.append(p)
+                    # ML pre-screen using DAILY OHLCV (not live ticks).
+                    # Tick-frequency features make RSI/volatility meaningless.
+                    ohlcv = cache.get(ticker)
+                    if ohlcv is None or len(ohlcv) < 60:
+                        logger.info(
+                            "Scanner: %s skipped — insufficient daily OHLCV for ML",
+                            ticker,
+                        )
+                        continue
 
-                    score = self.predictor.score(prices)
-                    if score >= self._bot_kwargs.get(
-                        "bullish_threshold", 0.75,
-                    ):
-                        logger.info(
-                            "Scanner: %s passed ML gate (%.3f). Adding bot.",
-                            ticker, score,
-                        )
-                        await self.add_bot(ticker)
+                    if self.predictor._ml_model is not None:
+                        signal = self.predictor.predict_signal(ohlcv)
+                        if signal == "BUY":
+                            logger.info(
+                                "Scanner: %s passed ML gate (BUY). Adding bot.",
+                                ticker,
+                            )
+                            await self.add_bot(ticker)
+                        else:
+                            logger.info(
+                                "Scanner: %s rejected by ML (signal=%s)",
+                                ticker, signal,
+                            )
                     else:
-                        logger.info(
-                            "Scanner: %s rejected by ML (%.3f < %.3f)",
-                            ticker, score,
-                            self._bot_kwargs.get("bullish_threshold", 0.75),
+                        # Rule-based fallback on daily closes
+                        closes = ohlcv["close"].astype(int).tolist()
+                        score = self.predictor.score(closes)
+                        threshold = self._bot_kwargs.get(
+                            "bullish_threshold", 0.75,
                         )
+                        if score >= threshold:
+                            logger.info(
+                                "Scanner: %s passed rule-based gate "
+                                "(%.3f >= %.3f). Adding bot.",
+                                ticker, score, threshold,
+                            )
+                            await self.add_bot(ticker)
+                        else:
+                            logger.info(
+                                "Scanner: %s rejected by rule-based "
+                                "(%.3f < %.3f)",
+                                ticker, score, threshold,
+                            )
 
             except asyncio.CancelledError:
                 break
@@ -289,12 +374,23 @@ class PortfolioManager:
             try:
                 self._check_drawdown()
 
+                # Phase 3: feed daily-return buffer for VaR tracking.
+                # (Every cycle here — the RiskManager only triggers once
+                # the buffer holds enough samples; refine to true daily
+                # deltas if a coarser cadence is preferred.)
+                cur_equity = self.total_equity
+                if self._last_equity_for_return > 0:
+                    daily_ret = (
+                        cur_equity - self._last_equity_for_return
+                    ) / self._last_equity_for_return
+                    self.risk_manager.update_daily_return(daily_ret)
+                self._last_equity_for_return = cur_equity
+
                 # Log portfolio-level equity
-                equity = self.total_equity
                 now = datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
                 with open(EQUITY_LOG, "a", newline="") as f:
                     csv.writer(f).writerow(
-                        [now, "PORTFOLIO", "", equity]
+                        [now, "PORTFOLIO", "", cur_equity]
                     )
             except KillSwitchError:
                 raise

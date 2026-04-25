@@ -355,6 +355,73 @@ class KISClient:
         return data
 
     # ═════════════════════════════════════════════════════════════════
+    #  Public API: 체결 조회 (실제 체결가 확인)
+    # ═════════════════════════════════════════════════════════════════
+
+    async def get_order_fill(self, order_no: str) -> dict:
+        """
+        Query actual fill price for a completed order.
+
+        Uses 주식일별주문체결조회 API (TTTC8001R / VTTC8001R).
+        Sums partial fills for the same order number.
+
+        Returns:
+            {"avg_fill_price": int, "filled_qty": int}
+            Both zero if nothing is filled yet.
+        """
+        token = await self._ensure_token()
+        tr_id = "TTTC8001R" if self.run_mode == "REAL" else "VTTC8001R"
+        url = (
+            f"{self.base_url}"
+            "/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
+        )
+        headers = self._headers(tr_id, token)
+
+        from datetime import datetime
+        today = datetime.now().strftime("%Y%m%d")
+        params = {
+            "CANO": self.cano,
+            "ACNT_PRDT_CD": self.acnt_prdt_cd,
+            "INQR_STRT_DT": today,
+            "INQR_END_DT": today,
+            "SLL_BUY_DVSN_CD": "00",
+            "INQR_DVSN": "00",
+            "PDNO": "",
+            "CCLD_DVSN": "01",
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no,
+            "INQR_DVSN_3": "00",
+            "INQR_DVSN_1": "",
+            "CTX_AREA_FK100": "",
+            "CTX_AREA_NK100": "",
+        }
+        data = await self._request(
+            "GET", url, headers=headers, params=params,
+        )
+
+        if data.get("rt_cd") != "0":
+            raise RuntimeError(
+                f"체결 조회 실패: [{data.get('msg_cd')}] {data.get('msg1')}"
+            )
+
+        outputs = data.get("output1", [])
+        if not outputs:
+            return {"avg_fill_price": 0, "filled_qty": 0}
+
+        total_qty = 0
+        total_amount = 0
+        for row in outputs:
+            if row.get("odno") != order_no:
+                continue
+            qty = int(row.get("tot_ccld_qty", "0") or 0)
+            amt = int(row.get("tot_ccld_amt", "0") or 0)
+            total_qty += qty
+            total_amount += amt
+
+        avg = total_amount // total_qty if total_qty > 0 else 0
+        return {"avg_fill_price": avg, "filled_qty": total_qty}
+
+    # ═════════════════════════════════════════════════════════════════
     #  Public API: 잔고 조회
     # ═════════════════════════════════════════════════════════════════
 

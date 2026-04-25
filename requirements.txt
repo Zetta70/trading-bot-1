@@ -10,3 +10,5 @@ pykrx>=1.0.45
 seaborn>=0.12.0
 numpy>=1.24.0
 yfinance>=0.2.30
+xgboost>=2.0.0
+catboost>=1.2.0

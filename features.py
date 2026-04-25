@@ -24,6 +24,7 @@ import pandas as pd
 def add_features(
     df: pd.DataFrame,
     index_df: pd.DataFrame | None = None,
+    vol_index_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Add all feature columns to an OHLCV DataFrame.
@@ -32,40 +33,37 @@ def add_features(
     ----------
     df : pd.DataFrame
         Must contain columns: open, high, low, close, volume.
-        Index should be datetime (KST).
     index_df : pd.DataFrame, optional
-        KOSPI index OHLCV with at least a 'close' column and matching
-        datetime index. Used for market-context features.
+        Market index (KOSPI / S&P 500) with a 'close' column.
+    vol_index_df : pd.DataFrame, optional
+        Volatility index (VKOSPI / VIX) with a 'close' column.
 
-    Returns
-    -------
-    pd.DataFrame
-        Original columns + all computed features.
-        NaN rows are preserved (caller decides how to handle them).
-
-    Notes
-    -----
     Every feature is computed using only data up to and including time t.
-    No negative shifts (e.g. shift(-1)) are used anywhere.
+    No negative shifts are used anywhere.
     """
     out = df.copy()
 
-    # Ensure numeric types
     for col in ("open", "high", "low", "close", "volume"):
         out[col] = pd.to_numeric(out[col], errors="coerce")
 
-    # ── 1. Price / Return ────────────────────────────────────────
     out = _add_price_return_features(out)
-
-    # ── 2. Technical Indicators ──────────────────────────────────
     out = _add_technical_features(out)
-
-    # ── 3. Volume ────────────────────────────────────────────────
     out = _add_volume_features(out)
 
-    # ── 4. Market Context ────────────────────────────────────────
     if index_df is not None:
         out = _add_market_context(out, index_df)
+
+    out = _add_regime_features(out, index_df)
+
+    if vol_index_df is not None and not vol_index_df.empty:
+        vol_idx = vol_index_df["close"].reindex(out.index, method="ffill")
+        out["vix_level"] = vol_idx
+        out["vix_chg_5d"] = vol_idx / vol_idx.shift(5) - 1
+        out["vix_percentile_252"] = vol_idx.rolling(252).rank(pct=True)
+    else:
+        out["vix_level"] = np.nan
+        out["vix_chg_5d"] = np.nan
+        out["vix_percentile_252"] = np.nan
 
     return out
 
@@ -97,6 +95,17 @@ def _add_price_return_features(df: pd.DataFrame) -> pd.DataFrame:
         (close - df["low"]) / hl_range,
         0.5,  # flat candle → neutral
     )
+
+    # Overnight gap: open_t / close_{t-1} - 1
+    prev_close = close.shift(1)
+    df["overnight_gap"] = df["open"] / prev_close - 1
+
+    # Gap filled inside the session?
+    prev_high = df["high"].shift(1)
+    prev_low = df["low"].shift(1)
+    gap_up_filled = (df["open"] > prev_high) & (df["low"] <= prev_high)
+    gap_dn_filled = (df["open"] < prev_low) & (df["high"] >= prev_low)
+    df["gap_filled"] = (gap_up_filled | gap_dn_filled).astype(int)
 
     return df
 
@@ -193,6 +202,25 @@ def _add_volume_features(df: pd.DataFrame) -> pd.DataFrame:
         1.0,
     )
 
+    # Volume imbalance — Lee-Ready-style approximation:
+    # Up days count as buy-initiated, down days as sell-initiated.
+    direction = np.where(df["close"] > df["open"], 1, -1)
+    signed_vol = direction * vol
+    buy_vol_20 = pd.Series(
+        np.where(signed_vol > 0, signed_vol, 0),
+        index=df.index,
+    ).rolling(20).sum()
+    total_vol_20 = vol.rolling(20).sum()
+    df["vol_imbalance_20"] = np.where(
+        total_vol_20 > 0,
+        buy_vol_20 / total_vol_20,
+        0.5,
+    )
+    df["vol_imbalance_trend"] = (
+        pd.Series(df["vol_imbalance_20"], index=df.index)
+        - pd.Series(df["vol_imbalance_20"], index=df.index).shift(5)
+    )
+
     return df
 
 
@@ -224,26 +252,83 @@ def _add_market_context(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# 5. Market Regime Features
+# ═══════════════════════════════════════════════════════════════════════
+
+def _add_regime_features(
+    df: pd.DataFrame,
+    index_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Market regime indicators: volatility regime, trend strength/direction,
+    and (optionally) trend alignment with a market index.
+    """
+    # Volatility regime: current 20-day vol / 1-year vol
+    vol_20 = df["log_ret_1d"].rolling(20).std()
+    vol_252 = df["log_ret_1d"].rolling(252).std()
+    df["vol_regime"] = np.where(vol_252 > 0, vol_20 / vol_252, 1.0)
+
+    # Trend strength: |EMA20 - EMA60| / ATR (unit-free)
+    ema20 = df["close"].ewm(span=20, adjust=False).mean()
+    ema60 = df["close"].ewm(span=60, adjust=False).mean()
+    atr14 = (
+        df["atr_norm"] * df["close"] if "atr_norm" in df.columns
+        else df["close"] * 0.02
+    )
+    df["trend_strength"] = (ema20 - ema60).abs() / atr14.replace(0, np.nan)
+
+    diff = ema20 - ema60
+    df["trend_direction"] = np.sign(diff).fillna(0)
+
+    if index_df is not None and not index_df.empty:
+        idx_close = index_df["close"].reindex(df.index, method="ffill")
+        idx_ema20 = idx_close.ewm(span=20, adjust=False).mean()
+        idx_ema60 = idx_close.ewm(span=60, adjust=False).mean()
+        df["index_trend_direction"] = np.sign(idx_ema20 - idx_ema60).fillna(0)
+        df["trend_alignment"] = (
+            df["trend_direction"] * df["index_trend_direction"]
+        )
+    else:
+        df["index_trend_direction"] = 0
+        df["trend_alignment"] = 0
+
+    return df
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Utility: list feature column names
 # ═══════════════════════════════════════════════════════════════════════
 
 OHLCV_COLS = {"open", "high", "low", "close", "volume"}
 
 
-def feature_columns(include_market: bool = False) -> list[str]:
+def feature_columns(
+    include_market: bool = False,
+    include_regime: bool = True,
+    include_vol_index: bool = False,
+) -> list[str]:
     """Return the list of feature column names (excluding OHLCV)."""
     cols = [
         # Price / Return
         "log_ret_1d", "log_ret_5d", "log_ret_20d", "log_ret_60d",
         "volatility_20d", "volatility_60d",
         "intraday_range", "close_location",
+        "overnight_gap", "gap_filled",
         # Technical
         "rsi_14", "macd", "macd_signal", "macd_hist", "bb_pctb",
         "sma_dev_5", "sma_dev_20", "sma_dev_60",
         "atr_norm",
         # Volume
         "vol_chg_1d", "vol_chg_5d", "obv_roc_20", "turnover_ratio_20",
+        "vol_imbalance_20", "vol_imbalance_trend",
     ]
     if include_market:
         cols += ["excess_ret_5d", "excess_ret_20d", "beta_60d"]
+    if include_regime:
+        cols += [
+            "vol_regime", "trend_strength", "trend_direction",
+            "index_trend_direction", "trend_alignment",
+        ]
+    if include_vol_index:
+        cols += ["vix_level", "vix_chg_5d", "vix_percentile_252"]
     return cols

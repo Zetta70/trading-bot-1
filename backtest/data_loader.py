@@ -91,6 +91,43 @@ def load_sp500(start: str, end: str) -> pd.DataFrame:
     return _load_us_ohlcv("^GSPC", start, end, label="S&P500")
 
 
+def load_vkospi(start: str, end: str) -> pd.DataFrame:
+    """
+    Load VKOSPI (KOSPI implied volatility index).
+
+    VKOSPI > 25 signals market stress; < 15 signals complacency.
+    Returns empty DataFrame if the data source can't serve the range.
+    """
+    import FinanceDataReader as fdr
+    logger.info("Loading VKOSPI (%s ~ %s)", start, end)
+    try:
+        df = fdr.DataReader("VKOSPI", start, end)
+        df.columns = [c.lower() for c in df.columns]
+        df = df[["close"]].dropna()
+        logger.info("Loaded %d VKOSPI rows", len(df))
+        return df
+    except Exception as e:
+        logger.warning("Failed to load VKOSPI: %s", e)
+        return pd.DataFrame(columns=["close"])
+
+
+def load_vix(start: str, end: str) -> pd.DataFrame:
+    """Load CBOE VIX (for US stocks regime features)."""
+    logger.info("Loading VIX (%s ~ %s)", start, end)
+    try:
+        import yfinance as yf
+        df = yf.download("^VIX", start=start, end=end, progress=False)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.droplevel(1)
+        df.columns = [c.lower() for c in df.columns]
+        df = df[["close"]].dropna()
+        logger.info("Loaded %d VIX rows", len(df))
+        return df
+    except Exception as e:
+        logger.warning("Failed to load VIX: %s", e)
+        return pd.DataFrame(columns=["close"])
+
+
 def load_usdkrw(start: str, end: str) -> pd.DataFrame:
     """
     Load daily USD/KRW exchange rate.

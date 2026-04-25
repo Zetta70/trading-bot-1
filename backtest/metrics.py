@@ -447,3 +447,150 @@ def format_integrated_metrics(result: dict) -> str:
     lines.append("")
     lines.append("═" * 60)
     return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Phase 4: Advanced Performance Metrics
+# ═══════════════════════════════════════════════════════════════════════
+#
+# These augment compute_metrics() with selection-bias-aware Sharpe variants
+# and a Calmar / detailed drawdown helper used by the validation runner.
+# They take a return Series directly (not the equity_df) so they can be
+# called with bootstrap samples and per-fold slices.
+
+def sharpe_ratio(
+    returns: pd.Series,
+    periods_per_year: int = 252,
+    risk_free_rate: float = 0.035,
+) -> float:
+    """Annualized Sharpe with risk-free adjustment (default 3.5% KOFR-ish)."""
+    rets = returns.dropna()
+    if len(rets) < 20 or rets.std() == 0:
+        return 0.0
+    excess = rets - risk_free_rate / periods_per_year
+    return float(np.sqrt(periods_per_year) * excess.mean() / excess.std())
+
+
+def sortino_ratio(
+    returns: pd.Series,
+    periods_per_year: int = 252,
+    risk_free_rate: float = 0.035,
+) -> float:
+    """Sortino: only penalizes downside volatility."""
+    rets = returns.dropna()
+    if len(rets) < 20:
+        return 0.0
+    excess = rets - risk_free_rate / periods_per_year
+    downside = excess[excess < 0]
+    if len(downside) == 0 or downside.std() == 0:
+        return 0.0
+    return float(
+        np.sqrt(periods_per_year) * excess.mean() / downside.std()
+    )
+
+
+def calmar_ratio(
+    returns: pd.Series,
+    periods_per_year: int = 252,
+) -> float:
+    """CAGR / |Max DD|."""
+    rets = returns.dropna()
+    if len(rets) < 20:
+        return 0.0
+    cum = (1 + rets).cumprod()
+    cagr = cum.iloc[-1] ** (periods_per_year / len(rets)) - 1
+    dd = (cum / cum.cummax() - 1).min()
+    if abs(dd) < 1e-6:
+        return 0.0
+    return float(cagr / abs(dd))
+
+
+def max_drawdown(returns: pd.Series) -> dict:
+    """Detailed drawdown stats: depth, peak-to-trough duration, recovery."""
+    rets = returns.dropna()
+    if len(rets) == 0:
+        return {"max_dd": 0.0, "duration_days": 0, "recovery_days": None}
+    cum = (1 + rets).cumprod()
+    peak = cum.cummax()
+    dd = cum / peak - 1
+    max_dd = float(dd.min())
+
+    trough_idx = dd.idxmin()
+    peak_idx = cum.loc[:trough_idx].idxmax()
+    duration = (
+        (trough_idx - peak_idx).days
+        if hasattr(trough_idx, "to_pydatetime") else 0
+    )
+
+    post_trough = cum.loc[trough_idx:]
+    recovery_threshold = peak.loc[peak_idx]
+    recovered = post_trough[post_trough >= recovery_threshold]
+    recovery_days = (
+        (recovered.index[0] - trough_idx).days
+        if len(recovered) > 0 and hasattr(trough_idx, "to_pydatetime")
+        else None
+    )
+
+    return {
+        "max_dd": max_dd,
+        "duration_days": duration,
+        "recovery_days": recovery_days,
+    }
+
+
+def deflated_sharpe(
+    sr_observed: float,
+    n_trials: int,
+    returns: pd.Series,
+    sr_benchmark: float = 0.0,
+) -> float:
+    """
+    Deflated Sharpe Ratio (Bailey & Lopez de Prado 2014).
+
+    Returns the probability that the observed Sharpe exceeds the
+    benchmark Sharpe, conditional on having tried n_trials variants.
+    Corrects for selection bias and non-normal returns (skew/kurtosis).
+
+    DSR > 0.95 is the minimum statistical bar; > 0.99 is "robust".
+    """
+    from scipy import stats
+
+    rets = returns.dropna()
+    n = len(rets)
+    if n < 30:
+        return 0.0
+
+    emc = 0.5772156649  # Euler-Mascheroni
+    if n_trials <= 1:
+        sr_threshold = sr_benchmark
+    else:
+        sr_threshold = (
+            (1 - emc) * stats.norm.ppf(1 - 1.0 / n_trials)
+            + emc * stats.norm.ppf(1 - 1.0 / (n_trials * np.e))
+        )
+
+    skew = float(rets.skew())
+    kurt = float(rets.kurtosis())
+
+    se_sharpe = np.sqrt(
+        (1 - skew * sr_observed + (kurt / 4) * sr_observed ** 2) / (n - 1)
+    )
+    if not np.isfinite(se_sharpe) or se_sharpe <= 0:
+        return 0.0
+
+    z = (sr_observed - sr_threshold) / se_sharpe
+    return float(stats.norm.cdf(z))
+
+
+def probabilistic_sharpe(
+    sr_observed: float,
+    returns: pd.Series,
+    sr_benchmark: float = 0.0,
+) -> float:
+    """
+    PSR: probability the true Sharpe exceeds benchmark, accounting for
+    non-normality. Equivalent to Deflated Sharpe with n_trials=1.
+    """
+    return deflated_sharpe(
+        sr_observed, n_trials=1, returns=returns, sr_benchmark=sr_benchmark,
+    )

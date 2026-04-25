@@ -4,8 +4,7 @@ Purged Walk-Forward Backtesting Engine.
 Implements time-series cross-validation with:
   - Fixed-size train/test windows sliding forward
   - Purge gap between train and test to prevent target leakage
-  - Per-fold StandardScaler fit (train only)
-  - Per-fold model training with early stopping
+  - Per-fold model training with early stopping (raw features; LightGBM is tree-based)
   - Signal generation → Simulator execution on test period
 
 This is the main orchestration module that ties together features.py,
@@ -18,9 +17,15 @@ import logging
 
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import StandardScaler
 
-from model import StockPredictor, make_target
+from model import (
+    StockPredictor,
+    EnsemblePredictor,
+    MetaLabeler,
+    make_target,
+    make_primary_label,
+    make_meta_label,
+)
 from features import add_features, feature_columns
 from backtest.simulator import TradingSimulator
 
@@ -43,9 +48,13 @@ class WalkForwardBacktest:
         Gap between train end and test start to prevent label leakage.
         Must be ≥ horizon + 1.
     horizon : int
-        Target label look-ahead period (days).
-    target_threshold : float
-        Return threshold for binary target labelling.
+        Target label look-ahead period (max holding bars for triple barrier).
+    pt_atr_mult : float
+        Profit-target barrier width in ATR units.
+    sl_atr_mult : float
+        Stop-loss barrier width in ATR units.
+    atr_period : int
+        ATR lookback used by the triple-barrier labeller.
     """
 
     def __init__(
@@ -54,21 +63,30 @@ class WalkForwardBacktest:
         test_window: int = 63,
         step: int | None = None,
         purge_days: int = 6,
-        horizon: int = 5,
-        target_threshold: float = 0.02,
+        horizon: int = 10,
+        pt_atr_mult: float = 2.0,
+        sl_atr_mult: float = 1.0,
+        atr_period: int = 14,
+        use_ensemble: bool = True,
+        use_meta_labeling: bool = True,
     ):
         self.train_window = train_window
         self.test_window = test_window
         self.step = step or test_window
         self.purge_days = max(purge_days, horizon + 1)
         self.horizon = horizon
-        self.target_threshold = target_threshold
+        self.pt_atr_mult = pt_atr_mult
+        self.sl_atr_mult = sl_atr_mult
+        self.atr_period = atr_period
+        self.use_ensemble = use_ensemble
+        self.use_meta_labeling = use_meta_labeling
 
     def run(
         self,
         ticker_ohlcv: dict[str, pd.DataFrame],
         index_df: pd.DataFrame | None = None,
         simulator: TradingSimulator | None = None,
+        vol_index_df: pd.DataFrame | None = None,
     ) -> dict:
         """
         Execute the full walk-forward backtest.
@@ -96,14 +114,35 @@ class WalkForwardBacktest:
         # ── Prepare features and targets for each ticker ─────────
         ticker_features: dict[str, pd.DataFrame] = {}
         ticker_targets: dict[str, pd.Series] = {}
+        ticker_targets_primary: dict[str, pd.Series] = {}
+        ticker_targets_meta: dict[str, pd.Series] = {}
+        ticker_returns: dict[str, pd.Series] = {}
 
         for ticker, ohlcv in ticker_ohlcv.items():
-            feat_df = add_features(ohlcv, index_df)
-            target = make_target(
-                ohlcv, horizon=self.horizon, threshold=self.target_threshold,
-            )
+            feat_df = add_features(ohlcv, index_df, vol_index_df)
+            if self.use_meta_labeling:
+                ticker_targets_primary[ticker] = make_primary_label(
+                    ohlcv,
+                    horizon=self.horizon,
+                    pt_atr_mult=self.pt_atr_mult,
+                    sl_atr_mult=self.sl_atr_mult,
+                )
+                ticker_targets_meta[ticker] = make_meta_label(
+                    ohlcv,
+                    horizon=self.horizon,
+                    pt_atr_mult=self.pt_atr_mult,
+                    sl_atr_mult=self.sl_atr_mult,
+                )
+            else:
+                ticker_targets[ticker] = make_target(
+                    ohlcv,
+                    horizon=self.horizon,
+                    pt_atr_mult=self.pt_atr_mult,
+                    sl_atr_mult=self.sl_atr_mult,
+                    atr_period=self.atr_period,
+                )
             ticker_features[ticker] = feat_df
-            ticker_targets[ticker] = target
+            ticker_returns[ticker] = ohlcv["close"].pct_change()
 
         # ── Determine fold boundaries using first ticker's index ─
         first_ticker = list(ticker_ohlcv.keys())[0]
@@ -121,7 +160,12 @@ class WalkForwardBacktest:
         fold_results = []
         importance_accum: list[pd.DataFrame] = []
         has_market = index_df is not None
-        feat_cols = feature_columns(include_market=has_market)
+        has_vol_index = vol_index_df is not None and not vol_index_df.empty
+        feat_cols = feature_columns(
+            include_market=has_market,
+            include_regime=True,
+            include_vol_index=has_vol_index,
+        )
 
         fold_idx = 0
         test_start_pos = min_start
@@ -149,22 +193,36 @@ class WalkForwardBacktest:
             )
 
             # ── Collect train/val data across all tickers ────────
-            X_train_parts, y_train_parts = [], []
+            X_train_parts: list[pd.DataFrame] = []
+            y_train_parts: list[pd.Series] = []
+            y_primary_parts: list[pd.Series] = []
+            y_meta_parts: list[pd.Series] = []
 
             for ticker in ticker_ohlcv:
                 feat = ticker_features[ticker]
-                tgt = ticker_targets[ticker]
-
-                # Select available feature columns
                 available = [c for c in feat_cols if c in feat.columns]
                 train_feat = feat.loc[feat.index.isin(train_dates), available]
-                train_tgt = tgt.loc[tgt.index.isin(train_dates)]
 
-                # Align and drop NaN
-                combined = train_feat.join(train_tgt).dropna()
-                if len(combined) > 0:
-                    X_train_parts.append(combined[available])
-                    y_train_parts.append(combined["target"])
+                if self.use_meta_labeling:
+                    yp = ticker_targets_primary[ticker]
+                    ym = ticker_targets_meta[ticker]
+                    yp = yp.loc[yp.index.isin(train_dates)]
+                    ym = ym.loc[ym.index.isin(train_dates)]
+                    combined = train_feat.join(
+                        yp.rename("y_primary"),
+                    ).join(ym.rename("y_meta")).dropna()
+                    if len(combined) > 0:
+                        X_train_parts.append(combined[available])
+                        y_primary_parts.append(combined["y_primary"])
+                        y_meta_parts.append(combined["y_meta"])
+                else:
+                    tgt = ticker_targets[ticker].loc[
+                        ticker_targets[ticker].index.isin(train_dates)
+                    ]
+                    combined = train_feat.join(tgt).dropna()
+                    if len(combined) > 0:
+                        X_train_parts.append(combined[available])
+                        y_train_parts.append(combined["target"])
 
             if not X_train_parts:
                 logger.warning("Fold %d: no training data. Skipping.", fold_idx)
@@ -172,27 +230,41 @@ class WalkForwardBacktest:
                 continue
 
             X_train_all = pd.concat(X_train_parts)
-            y_train_all = pd.concat(y_train_parts)
-
-            # ── Scale features (fit on train only) ───────────────
-            scaler = StandardScaler()
             available = list(X_train_all.columns)
-            X_train_scaled = pd.DataFrame(
-                scaler.fit_transform(X_train_all),
-                columns=available,
-                index=X_train_all.index,
-            )
 
-            # ── Split train into train/val (last 20% for early stopping)
-            val_size = max(1, int(len(X_train_scaled) * 0.2))
-            X_tr = X_train_scaled.iloc[:-val_size]
-            y_tr = y_train_all.iloc[:-val_size]
-            X_va = X_train_scaled.iloc[-val_size:]
-            y_va = y_train_all.iloc[-val_size:]
+            # Train/val split: last 20% for early stopping.
+            val_size = max(1, int(len(X_train_all) * 0.2))
+            X_tr = X_train_all.iloc[:-val_size]
+            X_va = X_train_all.iloc[-val_size:]
 
-            # ── Train model ──────────────────────────────────────
-            model = StockPredictor(task="classification")
-            model.train(X_tr, y_tr, X_va, y_va, early_stopping_rounds=50)
+            if self.use_meta_labeling:
+                y_primary_all = pd.concat(y_primary_parts)
+                y_meta_all = pd.concat(y_meta_parts)
+                yp_tr = y_primary_all.iloc[:-val_size]
+                yp_va = y_primary_all.iloc[-val_size:]
+                ym_tr = y_meta_all.iloc[:-val_size]
+                ym_va = y_meta_all.iloc[-val_size:]
+
+                model: "StockPredictor | EnsemblePredictor | MetaLabeler" = (
+                    MetaLabeler()
+                )
+                model.train(
+                    X_tr, yp_tr, ym_tr,
+                    X_va, yp_va, ym_va,
+                )
+            else:
+                y_train_all = pd.concat(y_train_parts)
+                y_tr = y_train_all.iloc[:-val_size]
+                y_va = y_train_all.iloc[-val_size:]
+
+                if self.use_ensemble:
+                    model = EnsemblePredictor(task="classification")
+                    model.train(X_tr, y_tr, X_va, y_va)
+                else:
+                    model = StockPredictor(task="classification")
+                    model.train(
+                        X_tr, y_tr, X_va, y_va, early_stopping_rounds=50,
+                    )
 
             imp = model.feature_importance()
             imp["fold"] = fold_idx
@@ -212,11 +284,21 @@ class WalkForwardBacktest:
                         continue
 
                     row = ohlcv.loc[date]
+                    # Pull ATR from the feature DataFrame (atr_norm is
+                    # ATR/close, so ATR = atr_norm * close).
+                    feat = ticker_features[ticker]
+                    atr_val = 0.0
+                    if date in feat.index and "atr_norm" in feat.columns:
+                        atr_norm = feat.loc[date, "atr_norm"]
+                        if pd.notna(atr_norm):
+                            atr_val = float(atr_norm) * float(row["close"])
+
                     ticker_data_today[ticker] = {
                         "open": float(row["open"]),
                         "high": float(row["high"]),
                         "low": float(row["low"]),
                         "close": float(row["close"]),
+                        "atr": atr_val,
                     }
                     close_prices[ticker] = float(row["close"])
 
@@ -229,20 +311,23 @@ class WalkForwardBacktest:
                     prev_date = test_dates[i - 1]
                     feat = ticker_features[ticker]
                     if prev_date in feat.index:
-                        feat_row = feat.loc[[prev_date], available].fillna(0)
-                        feat_scaled = pd.DataFrame(
-                            scaler.transform(feat_row),
-                            columns=available,
-                            index=feat_row.index,
-                        )
-                        prob = model.predict_proba(feat_scaled)[0]
-                        signal_probs[ticker] = prob
+                        feat_row = feat.loc[[prev_date], available]
+                        if feat_row.isna().any(axis=1).iloc[0]:
+                            signal_probs[ticker] = None
+                        else:
+                            prob = model.predict_proba(feat_row)[0]
+                            signal_probs[ticker] = prob
                     else:
                         signal_probs[ticker] = None
 
                 if ticker_data_today:
+                    returns_as_of_date = {
+                        t: ret.loc[ret.index < date]
+                        for t, ret in ticker_returns.items()
+                    }
                     simulator.step_portfolio(
                         date, ticker_data_today, signal_probs, close_prices,
+                        ticker_returns=returns_as_of_date,
                     )
 
             fold_trades = len(simulator.trades) - fold_trades_before
@@ -253,7 +338,9 @@ class WalkForwardBacktest:
                 "test_start": test_dates[0],
                 "test_end": test_dates[-1],
                 "n_trades": fold_trades,
-                "best_iteration": model.model.best_iteration if model.model else 0,
+                "best_iteration": getattr(
+                    getattr(model, "model", None), "best_iteration", 0,
+                ),
             })
 
             test_start_pos += self.step

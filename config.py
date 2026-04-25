@@ -99,13 +99,54 @@ class Config:
         self.ml_threshold_sell: float = float(os.getenv("ML_THRESHOLD_SELL", "0.45"))
         self.bt_train_window: int = int(os.getenv("BT_TRAIN_WINDOW", "756"))
         self.bt_test_window: int = int(os.getenv("BT_TEST_WINDOW", "63"))
-        self.bt_horizon: int = int(os.getenv("BT_HORIZON", "5"))
-        self.bt_target_threshold: float = float(os.getenv("BT_TARGET_THRESHOLD", "0.02"))
+        self.bt_horizon: int = int(os.getenv("BT_HORIZON", "10"))
+        # Triple Barrier ATR multipliers (replaces legacy BT_TARGET_THRESHOLD).
+        self.bt_pt_atr_mult: float = float(os.getenv("BT_PT_ATR_MULT", "2.0"))
+        self.bt_sl_atr_mult: float = float(os.getenv("BT_SL_ATR_MULT", "1.0"))
         self.stop_loss_pct: float = float(os.getenv("STOP_LOSS_PCT", "-0.05"))
+
+        # ── Entry Mode ──────────────────────────────────────────
+        self.entry_mode: str = os.getenv("ENTRY_MODE", "eod").lower()
+        self.max_trades_per_day: int = int(os.getenv("MAX_TRADES_PER_DAY", "2"))
+
+        # ── Phase 2: Model Architecture ────────────────────────
+        self.use_ensemble: bool = (
+            os.getenv("USE_ENSEMBLE", "true").lower() == "true"
+        )
+        self.use_meta_labeling: bool = (
+            os.getenv("USE_META_LABELING", "true").lower() == "true"
+        )
+        self.use_vol_index: bool = (
+            os.getenv("USE_VOL_INDEX", "true").lower() == "true"
+        )
 
         # ── FX (Exchange Rate) ──────────────────────────────────
         # Default USD/KRW rate used when real-time fetch fails
         self.default_usdkrw: float = float(os.getenv("DEFAULT_USDKRW", "1380.0"))
+
+        # ── Phase 3: Portfolio Management ───────────────────────
+        self.use_kelly_sizing: bool = (
+            os.getenv("USE_KELLY_SIZING", "true").lower() == "true"
+        )
+        self.kelly_multiplier: float = float(
+            os.getenv("KELLY_MULTIPLIER", "0.25")
+        )
+        self.target_portfolio_vol: float = float(
+            os.getenv("TARGET_PORTFOLIO_VOL", "0.15")
+        )
+        self.max_sector_exposure: float = float(
+            os.getenv("MAX_SECTOR_EXPOSURE", "0.30")
+        )
+        self.portfolio_stop: float = float(
+            os.getenv("PORTFOLIO_STOP", "-0.05")
+        )
+        self.portfolio_kill: float = float(
+            os.getenv("PORTFOLIO_KILL", "-0.10")
+        )
+        self.use_cross_sectional_scanner: bool = (
+            os.getenv("USE_CS_SCANNER", "true").lower() == "true"
+        )
+        self.cs_scanner_top_n: int = int(os.getenv("CS_SCANNER_TOP_N", "15"))
 
     def validate(self) -> None:
         """Exit with error if KIS credentials are missing."""

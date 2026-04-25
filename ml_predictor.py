@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import math
 import logging
+import pickle
 from pathlib import Path
 
 import pandas as pd
@@ -55,13 +56,36 @@ class MLPredictor:
         self.threshold_buy = threshold_buy
         self.threshold_sell = threshold_sell
         self._ml_model = None
+        self._model_type: str = "none"
 
         if model_path and Path(model_path).exists():
             try:
-                from model import StockPredictor
-                self._ml_model = StockPredictor(task="classification")
-                self._ml_model.load(model_path)
-                logger.info("ML model loaded from %s", model_path)
+                with open(model_path, "rb") as f:
+                    payload = pickle.load(f)  # noqa: S301
+
+                if payload.get("meta_labeler"):
+                    from model import MetaLabeler
+                    self._ml_model = MetaLabeler()
+                    self._ml_model.load(model_path)
+                    self._model_type = "meta"
+                elif payload.get("ensemble") or (
+                    "lgb_model_str" in payload
+                    and "xgb_model_bytes" in payload
+                ):
+                    from model import EnsemblePredictor
+                    self._ml_model = EnsemblePredictor()
+                    self._ml_model.load(model_path)
+                    self._model_type = "ensemble"
+                else:
+                    from model import StockPredictor
+                    self._ml_model = StockPredictor(task="classification")
+                    self._ml_model.load(model_path)
+                    self._model_type = "single"
+
+                logger.info(
+                    "ML model loaded from %s (type=%s)",
+                    model_path, self._model_type,
+                )
             except Exception as e:
                 logger.warning(
                     "Failed to load ML model from %s: %s. "
@@ -69,9 +93,10 @@ class MLPredictor:
                     model_path, e,
                 )
                 self._ml_model = None
+                self._model_type = "none"
 
     @classmethod
-    def from_config(cls) -> "MLPredictor":
+    def from_config(cls, cfg=None) -> "MLPredictor":
         """
         Create an MLPredictor with thresholds from .env (via Config).
 
@@ -79,8 +104,9 @@ class MLPredictor:
         ML_THRESHOLD_BUY / ML_THRESHOLD_SELL / ML_MODEL_PATH values
         from the .env file.
         """
-        from config import Config
-        cfg = Config()
+        if cfg is None:
+            from config import Config
+            cfg = Config()
         return cls(
             model_path=cfg.ml_model_path,
             threshold_buy=cfg.ml_threshold_buy,
@@ -175,15 +201,22 @@ class MLPredictor:
 
             latest = features_df[available].iloc[[-1]]
 
-            # Skip if too many NaN features
-            non_null = latest.dropna(axis=1)
-            if len(non_null.columns) < len(available) * 0.5:
-                logger.debug("Too many NaN features, returning HOLD")
+            # Strict NaN check: refuse to predict on incomplete features.
+            # Filling NaN with 0 would inject extreme values (e.g. beta=0,
+            # rsi=0) into the model, producing misleading probabilities.
+            if latest.isna().any(axis=1).iloc[0]:
+                nan_cols = latest.columns[latest.isna().iloc[0]].tolist()
+                logger.info(
+                    "ML inference skipped: NaN in features %s -> HOLD",
+                    nan_cols,
+                )
                 return "HOLD"
 
-            # Fill remaining NaN with 0 for inference
-            latest = latest.fillna(0)
             prob = self._ml_model.predict_proba(latest)[0]
+            logger.info(
+                "ML inference: prob=%.4f, threshold_buy=%.2f, threshold_sell=%.2f",
+                prob, self.threshold_buy, self.threshold_sell,
+            )
 
             if prob >= self.threshold_buy:
                 return "BUY"

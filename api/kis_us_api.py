@@ -505,6 +505,24 @@ class KISUSClient:
         return krw_amount / fx if fx > 0 else 0.0
 
     # ═════════════════════════════════════════════════════════════════
+    # Order Fill Query (stub — see TODO)
+    # ═════════════════════════════════════════════════════════════════
+
+    async def get_order_fill(self, order_no: str) -> dict:
+        """
+        Query US order fill price.
+
+        Returns:
+            {"avg_fill_price": int, "filled_qty": int}
+
+        TODO: Implement full US fill query (TR: TTTS3035R / VTTS3035R,
+        URL: /uapi/overseas-stock/v1/trading/inquire-ccnl).
+        For now, return zeros so the caller falls back to the request price.
+        """
+        logger.debug("US fill query not implemented for %s", order_no)
+        return {"avg_fill_price": 0, "filled_qty": 0}
+
+    # ═════════════════════════════════════════════════════════════════
     # Cleanup
     # ═════════════════════════════════════════════════════════════════
 

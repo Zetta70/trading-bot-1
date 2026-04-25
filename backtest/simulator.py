@@ -46,6 +46,8 @@ class Position:
     entry_price: float
     shares: int
     peak_price: float  # for trailing / stop-loss
+    entry_atr: float = 0.0
+    bars_held: int = 0
 
 
 class TradingSimulator:
@@ -88,6 +90,12 @@ class TradingSimulator:
         stop_loss_pct: float = -0.07,
         threshold_buy: float = 0.55,
         threshold_sell: float = 0.45,
+        use_kelly_sizing: bool = True,
+        kelly_multiplier: float = 0.25,
+        target_portfolio_vol: float = 0.15,
+        correlation_lookback: int = 60,
+        pt_atr_mult: float = 2.0,
+        sl_atr_mult: float = 1.0,
     ):
         self.initial_capital = initial_capital
         self.commission = commission
@@ -98,6 +106,15 @@ class TradingSimulator:
         self.stop_loss_pct = stop_loss_pct
         self.threshold_buy = threshold_buy
         self.threshold_sell = threshold_sell
+
+        # Phase 3: dynamic sizing
+        self.use_kelly_sizing = use_kelly_sizing
+        self.kelly_multiplier = kelly_multiplier
+        self.target_portfolio_vol = target_portfolio_vol
+        self.correlation_lookback = correlation_lookback
+        self.pt_atr_mult = pt_atr_mult
+        self.sl_atr_mult = sl_atr_mult
+        self._returns_cache: dict[str, pd.Series] = {}
 
         # State
         self.cash: float = initial_capital
@@ -111,6 +128,7 @@ class TradingSimulator:
         self.positions.clear()
         self.trades.clear()
         self.daily_equity.clear()
+        self._returns_cache.clear()
 
     # ── Cost Calculations ────────────────────────────────────────
 
@@ -129,9 +147,16 @@ class TradingSimulator:
         ticker: str,
         date: pd.Timestamp,
         open_price: float,
+        entry_atr: float = 0.0,
+        ml_probability: float = 0.55,
+        stock_returns: pd.Series | None = None,
     ) -> bool:
         """
         Execute a buy order at the given open price.
+
+        Uses dynamic position sizing (Kelly + vol target + correlation
+        penalty) when ``use_kelly_sizing`` is True and stock_returns is
+        supplied; otherwise falls back to the fixed ``max_position_pct``.
 
         Returns True if executed, False if skipped.
         """
@@ -140,11 +165,44 @@ class TradingSimulator:
         if len(self.positions) >= self.max_positions:
             return False
 
-        # Position sizing: max_position_pct of current portfolio value
         portfolio_value = self._portfolio_value_at(open_price)
-        max_alloc = portfolio_value * self.max_position_pct
-        cost_per_share = open_price * (1 + self.commission + self.slippage)
 
+        if self.use_kelly_sizing and stock_returns is not None:
+            from position_sizer import compute_position_size
+
+            vol = stock_returns.dropna().tail(60).std() * np.sqrt(252)
+            if np.isnan(vol) or vol <= 0:
+                vol = 0.25
+
+            existing_rets = {
+                t: self._returns_cache.get(t, pd.Series(dtype=float))
+                for t in self.positions
+            }
+
+            amount, debug = compute_position_size(
+                portfolio_equity=portfolio_value,
+                ml_probability=ml_probability,
+                stock_annualized_vol=float(vol),
+                candidate_returns=stock_returns,
+                existing_returns=existing_rets,
+                kelly_multiplier=self.kelly_multiplier,
+                target_portfolio_vol=self.target_portfolio_vol,
+                max_weight=self.max_position_pct,
+                pt_atr_mult=self.pt_atr_mult,
+                sl_atr_mult=self.sl_atr_mult,
+            )
+            logger.info(
+                "[%s] Sizing: prob=%.3f vol=%.2f → %s",
+                ticker, ml_probability, vol, debug,
+            )
+            max_alloc = amount
+        else:
+            max_alloc = portfolio_value * self.max_position_pct
+
+        if max_alloc <= 0:
+            return False
+
+        cost_per_share = open_price * (1 + self.commission + self.slippage)
         if cost_per_share <= 0:
             return False
 
@@ -166,7 +224,12 @@ class TradingSimulator:
             entry_price=open_price,
             shares=shares,
             peak_price=open_price,
+            entry_atr=entry_atr,
+            bars_held=0,
         )
+
+        if stock_returns is not None:
+            self._returns_cache[ticker] = stock_returns
         return True
 
     def _execute_sell(
@@ -282,6 +345,7 @@ class TradingSimulator:
         ticker_data: dict[str, dict],
         signal_probs: dict[str, float | None],
         close_prices: dict[str, float],
+        ticker_returns: dict[str, pd.Series] | None = None,
     ) -> None:
         """
         Process one day for all tickers at once.
@@ -289,29 +353,67 @@ class TradingSimulator:
         Parameters
         ----------
         date : Current trading date.
-        ticker_data : {ticker: {open, high, low, close}} for this date.
+        ticker_data : {ticker: {open, high, low, close[, atr]}} for this date.
         signal_probs : {ticker: prob or None} from previous day.
         close_prices : {ticker: close_price} for mark-to-market.
+        ticker_returns : optional {ticker: past return series} used by
+            Kelly/vol/correlation sizing. When omitted, sizing falls back
+            to the fixed max_position_pct path.
         """
-        # 1. Stop-loss checks first (across all tickers)
+        # 1. Stop-loss checks first (across all tickers).
+        # Priority: ATR-based chandelier + initial stop when entry_atr
+        # was recorded, else legacy percentage stop. Time-exit after 15
+        # bars regardless.
         for ticker in list(self.positions.keys()):
             if ticker not in ticker_data:
                 continue
             ohlc = ticker_data[ticker]
             pos = self.positions[ticker]
             pos.peak_price = max(pos.peak_price, ohlc["high"])
-            loss = (ohlc["low"] - pos.entry_price) / pos.entry_price
-            if loss <= self.stop_loss_pct:
-                stop_price = pos.entry_price * (1 + self.stop_loss_pct)
-                self._execute_sell(ticker, date, stop_price, reason="stop_loss")
+            pos.bars_held += 1
+
+            stopped = False
+            if pos.entry_atr > 0:
+                chand_stop = pos.peak_price - 3.0 * pos.entry_atr
+                init_stop = pos.entry_price - self.sl_atr_mult * pos.entry_atr
+                effective_stop = max(chand_stop, init_stop)
+                if ohlc["low"] <= effective_stop:
+                    self._execute_sell(
+                        ticker, date, effective_stop, reason="atr_stop",
+                    )
+                    stopped = True
+            elif self.stop_loss_pct < 0:
+                loss = (ohlc["low"] - pos.entry_price) / pos.entry_price
+                if loss <= self.stop_loss_pct:
+                    stop_price = pos.entry_price * (1 + self.stop_loss_pct)
+                    self._execute_sell(
+                        ticker, date, stop_price, reason="stop_loss",
+                    )
+                    stopped = True
+
+            if stopped:
+                continue
+
+            if pos.bars_held >= 15:
+                self._execute_sell(
+                    ticker, date, ohlc["close"], reason="time_exit",
+                )
 
         # 2. Execute signals
         for ticker, prob in signal_probs.items():
             if prob is None or ticker not in ticker_data:
                 continue
             open_price = ticker_data[ticker]["open"]
+            ticker_atr = ticker_data[ticker].get("atr", 0.0)
+            stock_rets = (ticker_returns or {}).get(ticker)
+
             if prob >= self.threshold_buy:
-                self._execute_buy(ticker, date, open_price)
+                self._execute_buy(
+                    ticker, date, open_price,
+                    entry_atr=ticker_atr,
+                    ml_probability=prob,
+                    stock_returns=stock_rets,
+                )
             elif prob <= self.threshold_sell:
                 self._execute_sell(ticker, date, open_price, reason="signal")
 
