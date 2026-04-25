@@ -149,7 +149,7 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
         )
 
     bot_kwargs = {
-        "qty": 1,
+        # Patch 2: qty is no longer a kwarg — _execute sizes dynamically.
         "threshold": config.threshold,
         "poll_interval": config.poll_interval,
         "sma_period": config.sma_period,
@@ -223,7 +223,7 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
 
     us_cash = int(config.initial_cash * config.us_allocation_pct)
     bot_kwargs = {
-        "qty": 1,
+        # Patch 2: qty is no longer a kwarg — _execute sizes dynamically.
         "threshold": config.threshold,
         "poll_interval": config.poll_interval,
         "sma_period": config.sma_period,

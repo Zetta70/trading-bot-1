@@ -16,12 +16,18 @@ import collections
 import csv
 import logging
 import time
+import warnings
 from datetime import datetime
 from pathlib import Path
 
 from config import KST
 from ml_predictor import MLPredictor
 from ohlcv_cache import get_cache
+
+# Sentinel for the deprecated `qty` __init__ kwarg (Patch 2). Lets us
+# distinguish "user supplied qty=N" from "default applied", so the
+# deprecation warning fires only on actual use.
+_QTY_UNSET = object()
 
 logger = logging.getLogger(__name__)
 trade_logger = logging.getLogger("trade")
@@ -62,7 +68,7 @@ class TradingBot:
         ticker: str,
         predictor: MLPredictor,
         *,
-        qty: int = 1,
+        qty=_QTY_UNSET,  # DEPRECATED (Patch 2) — qty is now sized dynamically
         threshold: float = 0.005,
         poll_interval: int = 10,
         sma_period: int = 20,
@@ -79,7 +85,20 @@ class TradingBot:
         self.client = client
         self.ticker = ticker
         self.predictor = predictor
-        self.qty = qty
+        # qty is deprecated (Patch 2). Keep the attribute for any external
+        # readers, but _execute now sizes BUY by cash and SELL by position.
+        if qty is _QTY_UNSET:
+            self.qty = 1  # legacy default for any read-only consumers
+        else:
+            warnings.warn(
+                "TradingBot(qty=...) is deprecated; qty is now sized "
+                "dynamically inside _execute (BUY: cash * 0.95 / "
+                "cost-per-share; SELL: full liquidation). The argument "
+                "is accepted for backward compatibility but ignored.",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.qty = qty
         self.threshold = threshold
         self.poll_interval = poll_interval
         self.sma_period = sma_period
@@ -426,10 +445,53 @@ class TradingBot:
     # ── Order Execution ──────────────────────────────────────────────
 
     async def _execute(self, side: str, price) -> None:
+        # ── Decide qty BEFORE placing the order (Patch 2) ────────
+        # BUY:  size to ~95% of cash (5% buffer for cost/slippage drift),
+        #       refuse to add to an existing position (no averaging up).
+        # SELL: full liquidation — sell whatever position exists.
+        fx = self._fx_to_krw()  # 1.0 for KRW bots
+
+        if side == "BUY":
+            if self.position > 0:
+                logger.info(
+                    "[%s] BUY skipped: already holding %d shares "
+                    "(no averaging up)",
+                    self.ticker, self.position,
+                )
+                return
+
+            usable_cash_krw = int(self.cash * 0.95)
+            # Slippage buffer (0.1%) so the request doesn't get clipped
+            # at fill time to one share less than we expected.
+            cost_per_share_native = price * (1 + self.commission + 0.001)
+            cost_per_share_krw = cost_per_share_native * fx
+            if cost_per_share_krw <= 0:
+                logger.warning(
+                    "[%s] BUY skipped: invalid cost-per-share %.2f",
+                    self.ticker, cost_per_share_krw,
+                )
+                return
+
+            qty_to_trade = int(usable_cash_krw // cost_per_share_krw)
+            if qty_to_trade < 1:
+                logger.info(
+                    "[%s] BUY skipped: insufficient cash "
+                    "(have=%d KRW, need ~%d KRW for 1 share)",
+                    self.ticker, self.cash, int(cost_per_share_krw),
+                )
+                return
+        else:  # SELL
+            if self.position < 1:
+                logger.info(
+                    "[%s] SELL skipped: no open position", self.ticker,
+                )
+                return
+            qty_to_trade = self.position
+
         ml_score = self.predictor.score(self._price_history)
         try:
             result = await self.client.place_order(
-                ticker=self.ticker, qty=self.qty, side=side,
+                ticker=self.ticker, qty=qty_to_trade, side=side,
                 order_type="market",
             )
             output = result.get("output", {})
@@ -451,44 +513,41 @@ class TradingBot:
                         self.ticker, e,
                     )
 
-            # Update portfolio. Cost/proceeds are computed in the bot's
-            # native currency, then converted to KRW before adjusting
-            # self.cash (which is always KRW int).
             sell_tax = self.tax_kr if self.currency == "KRW" else self.tax_us
-            fx = self._fx_to_krw()  # 1.0 for KRW bots
 
             if side == "BUY":
-                cost_native = fill_price * self.qty * (1 + self.commission)
+                cost_native = fill_price * qty_to_trade * (1 + self.commission)
                 cost_krw = int(cost_native * fx)
                 self.cash -= cost_krw
-                self.position += self.qty
+                self.position += qty_to_trade
                 self._highest_since_entry = fill_price
                 if not self._entry_atr:
                     self._entry_atr = fill_price * 0.02
             else:
                 proceeds_native = (
-                    fill_price * self.qty
+                    fill_price * qty_to_trade
                     * (1 - self.commission - sell_tax)
                 )
                 proceeds_krw = int(proceeds_native * fx)
                 self.cash += proceeds_krw
-                self.position -= self.qty
-                if self.position <= 0:
-                    self._highest_since_entry = 0
-                    self._entry_atr = 0.0
+                # Always full liquidation on SELL.
+                self.position = 0
+                self._highest_since_entry = 0
+                self._entry_atr = 0.0
 
             self.reference_price = fill_price
             self._trades_today += 1
 
             self._append_trade_csv(
-                side, price, fill_price, order_no, ml_score,
+                side, price, fill_price, order_no, ml_score, qty_to_trade,
             )
             trade_logger.info(
-                "%s %s x%d @ %s (fill=%s, fx=%.1f) pos=%d "
-                "equity=%d KRW ML=%.3f",
-                side, self.ticker, self.qty,
+                "%s %s x%d @ %s (fill=%s %s, fx=%.1f) "
+                "cash=%d KRW pos=%d equity=%d KRW ML=%.3f",
+                side, self.ticker, qty_to_trade,
                 self._fmt_price(price), self._fmt_price(fill_price),
-                fx, self.position, self.equity, ml_score,
+                self.currency, fx,
+                self.cash, self.position, self.equity, ml_score,
             )
 
         except Exception as e:
@@ -498,11 +557,12 @@ class TradingBot:
 
     def _append_trade_csv(
         self, side: str, price, fill_price,
-        order_no: str, ml_score: float,
+        order_no: str, ml_score: float, qty: int | None = None,
     ) -> None:
         row = [
             self._now_str(), self.ticker, side, price, fill_price,
-            self.qty, order_no, self.equity, f"{ml_score:.3f}",
+            qty if qty is not None else self.qty,
+            order_no, self.equity, f"{ml_score:.3f}",
         ]
         with open(TRADE_LOG, "a", newline="") as f:
             csv.writer(f).writerow(row)

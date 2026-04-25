@@ -92,7 +92,6 @@ def _new_bot(currency, client, **kw):
         predictor=FakePredictor(),
         currency=currency,
         initial_cash=200_000,
-        qty=1,
         commission=0.00015,
         tax_kr=0.0023,
         tax_us=0.0,
@@ -152,7 +151,7 @@ def test_buy_usd_deducts_krw_using_fx():
     bot = _new_bot("USD", client)
     bot.cash = 200_000
     bot.position = 0
-    bot.qty = 1
+    # qty is sized dynamically in _execute (Patch 2)
 
     asyncio.run(bot._execute("BUY", 130.0))
 
@@ -169,7 +168,7 @@ def test_sell_usd_adds_krw_using_fx():
     bot = _new_bot("USD", client)
     bot.cash = 0
     bot.position = 1
-    bot.qty = 1
+    # qty is sized dynamically in _execute (Patch 2)
     bot._entry_atr = 5.0
 
     asyncio.run(bot._execute("SELL", 140.0))
@@ -183,18 +182,22 @@ def test_sell_usd_adds_krw_using_fx():
 
 
 def test_buy_krw_path_unchanged():
-    """KRW bot should compute cash exactly as before (FX=1)."""
+    """KRW bot should compute cash with FX=1 (cost = price * qty * commission).
+
+    Patch 2 sizes qty dynamically; we constrain cash so the dynamic
+    sizer arrives at exactly 1 share, then check the cash math is
+    unaffected by the FX path.
+    """
     client = FakeKRClient()
     bot = _new_bot("KRW", client)
-    bot.cash = 1_000_000
+    bot.cash = 80_000  # only enough for ~1 share at 70k
     bot.position = 0
-    bot.qty = 1
 
     asyncio.run(bot._execute("BUY", 70_000))
 
     expected_cost = int(70_000 * 1 * (1 + 0.00015))
-    assert bot.cash == 1_000_000 - expected_cost
     assert bot.position == 1
+    assert bot.cash == 80_000 - expected_cost
 
 
 def test_adapter_does_not_scale_prices():
