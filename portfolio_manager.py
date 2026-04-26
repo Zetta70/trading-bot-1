@@ -28,6 +28,11 @@ logger = logging.getLogger(__name__)
 
 STATE_FILE = "state.json"
 
+# Patch 6: state schema versioning. Bump when the saved-state shape
+# changes in a non-additive way; old state with a different version
+# is rejected on load (fresh start, no silent default pollution).
+SCHEMA_VERSION = 2
+
 
 class KillSwitchError(Exception):
     """Raised when the global drawdown limit is breached."""
@@ -335,6 +340,7 @@ class PortfolioManager:
 
     def save_state(self) -> None:
         state = {
+            "schema_version": SCHEMA_VERSION,
             "timestamp": datetime.now(KST).isoformat(),
             "remaining_cash": self._remaining_cash,
             "peak_equity": self._peak_equity,
@@ -347,7 +353,25 @@ class PortfolioManager:
         }
         with open(STATE_FILE, "w") as f:
             json.dump(state, f, indent=2, ensure_ascii=False)
-        logger.debug("State saved to %s", STATE_FILE)
+        logger.debug("State saved to %s (v%d)", STATE_FILE, SCHEMA_VERSION)
+
+    @staticmethod
+    def _migrate_state(old_state: dict, from_v: int, to_v: int) -> dict | None:
+        """
+        Migrate a saved state across schema versions.
+
+        Returns the migrated dict if a migration path is wired, or None
+        if no migration is implemented (caller will treat that as a
+        rejected load and start fresh). The seam is intentionally empty
+        for now — establishes the integration point without committing
+        to a specific rollover policy.
+        """
+        logger.warning(
+            "No migration implemented from schema v%s to v%s. "
+            "Starting fresh.",
+            from_v, to_v,
+        )
+        return None
 
     def load_state(self) -> bool:
         """Load saved state. Returns True if state was restored."""
@@ -360,6 +384,25 @@ class PortfolioManager:
         except (json.JSONDecodeError, OSError) as e:
             logger.warning("Failed to load state: %s", e)
             return False
+
+        # Patch 6: schema version gate. Reject mismatched versions
+        # rather than silently filling in defaults — that's how
+        # incompatible state silently corrupts a recovery.
+        version = state.get("schema_version")
+        if version != SCHEMA_VERSION:
+            if version is None:
+                logger.warning(
+                    "State file has no schema_version (pre-v%d). "
+                    "Refusing to load — starting fresh.",
+                    SCHEMA_VERSION,
+                )
+                return False
+            migrated = self._migrate_state(
+                state, version, SCHEMA_VERSION,
+            )
+            if migrated is None:
+                return False
+            state = migrated
 
         self._remaining_cash = state.get(
             "remaining_cash", self.initial_cash,
@@ -381,8 +424,8 @@ class PortfolioManager:
             restored += 1
 
         logger.info(
-            "State restored: %d bots, equity=%s KRW (last sync: %s)",
-            restored, f"{self.total_equity:,}",
+            "State restored (v%d): %d bots, equity=%s KRW (last sync: %s)",
+            SCHEMA_VERSION, restored, f"{self.total_equity:,}",
             self._last_sync_time or "never",
         )
         self._state_loaded = True
