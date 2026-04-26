@@ -523,22 +523,147 @@ class KISUSClient:
         return krw_amount / fx if fx > 0 else 0.0
 
     # ═════════════════════════════════════════════════════════════════
-    # Order Fill Query (stub — see TODO)
+    # Order Fill Query (Patch 4)
     # ═════════════════════════════════════════════════════════════════
+
+    # Field-name fallback chain for partial-fill rows. KIS overseas
+    # endpoints have inconsistent naming across versions, so we try a
+    # priority list and log a WARNING if none match (so an operator can
+    # patch the chain without redeploying core logic).
+    _US_FILL_QTY_KEYS = ("ft_ccld_qty", "tot_ccld_qty", "ccld_qty")
+    _US_FILL_AMT_KEYS = (
+        "ft_ccld_amt2", "tr_amt", "ft_ccld_amt3", "ccld_amt", "ft_ccld_amt",
+    )
+    _US_FILL_PRICE_KEYS = (
+        "ovrs_excg_unpr", "ft_ccld_unpr3", "ccld_unpr", "ord_unpr",
+    )
+
+    @staticmethod
+    def _parse_first_float(row: dict, keys: tuple[str, ...]) -> float | None:
+        """Return the first parseable float across the candidate keys."""
+        for k in keys:
+            v = row.get(k)
+            if v in (None, "", "."):
+                continue
+            try:
+                f = float(v)
+                if f != 0:
+                    return f
+            except (ValueError, TypeError):
+                continue
+        return None
 
     async def get_order_fill(self, order_no: str) -> dict:
         """
-        Query US order fill price.
+        Query actual fill price for a completed US order.
 
-        Returns:
-            {"avg_fill_price": int, "filled_qty": int}
+        TR ID: TTTS3035R (REAL) / VTTS3035R (MOCK)
+        URL  : /uapi/overseas-stock/v1/trading/inquire-ccnl
 
-        TODO: Implement full US fill query (TR: TTTS3035R / VTTS3035R,
-        URL: /uapi/overseas-stock/v1/trading/inquire-ccnl).
-        For now, return zeros so the caller falls back to the request price.
+        Sums partial fills sharing the same ``odno`` and returns a
+        weighted average price. Field-name parsing is tolerant
+        (see ``_US_FILL_*_KEYS``) — if no recognized field is found
+        a WARNING is logged with the row keys and zero is returned
+        so the caller falls back to the request price.
+
+        Returns
+        -------
+        ``{"avg_fill_price": float (USD per share), "filled_qty": int}``
         """
-        logger.debug("US fill query not implemented for %s", order_no)
-        return {"avg_fill_price": 0, "filled_qty": 0}
+        token = await self._ensure_token()
+        tr_id = "TTTS3035R" if self.run_mode == "REAL" else "VTTS3035R"
+        url = (
+            f"{self.base_url}"
+            "/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        )
+        headers = self._headers(tr_id, token)
+
+        from datetime import datetime as _dt
+        today = _dt.now().strftime("%Y%m%d")
+        params = {
+            "CANO": self.cano,
+            "ACNT_PRDT_CD": self.acnt_prdt_cd,
+            "PDNO": "",
+            "ORD_STRT_DT": today,
+            "ORD_END_DT": today,
+            "SLL_BUY_DVSN": "00",        # 00: 전체
+            "CCLD_NCCS_DVSN": "00",      # 00: 전체
+            "OVRS_EXCG_CD": "NASD",
+            "SORT_SQN": "DS",
+            "ORD_DT": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no,
+            "CTX_AREA_FK200": "",
+            "CTX_AREA_NK200": "",
+        }
+
+        try:
+            data = await self._request(
+                "GET", url, headers=headers, params=params,
+            )
+        except Exception as e:
+            logger.warning(
+                "US fill query failed for %s: %s", order_no, e,
+            )
+            return {"avg_fill_price": 0.0, "filled_qty": 0}
+
+        if data.get("rt_cd") != "0":
+            logger.warning(
+                "US fill query error for %s: [%s] %s",
+                order_no, data.get("msg_cd"), data.get("msg1"),
+            )
+            return {"avg_fill_price": 0.0, "filled_qty": 0}
+
+        outputs = data.get("output") or data.get("output1") or []
+        if not outputs:
+            return {"avg_fill_price": 0.0, "filled_qty": 0}
+
+        total_qty = 0
+        total_amount_usd = 0.0
+        unparsed_keys: set[str] = set()
+
+        for row in outputs:
+            row_odno = (
+                row.get("odno") or row.get("ODNO") or row.get("ord_no")
+            )
+            if row_odno and row_odno != order_no:
+                continue
+
+            qty = self._parse_first_float(row, self._US_FILL_QTY_KEYS)
+            if not qty or qty <= 0:
+                continue
+            qty_int = int(qty)
+
+            # Prefer total amount → unit price = amount / qty.
+            amt = self._parse_first_float(row, self._US_FILL_AMT_KEYS)
+            if amt is not None and amt > 0:
+                unit_price = amt / qty
+            else:
+                unit_price = self._parse_first_float(
+                    row, self._US_FILL_PRICE_KEYS,
+                )
+                if unit_price is None:
+                    unparsed_keys.update(row.keys())
+                    continue
+
+            total_qty += qty_int
+            total_amount_usd += unit_price * qty_int
+
+        if total_qty == 0:
+            if unparsed_keys:
+                logger.warning(
+                    "US fill query: %s — no recognized qty/amount/price "
+                    "fields. Available keys: %s. Patch the field-name "
+                    "chain in KISUSClient._US_FILL_*_KEYS.",
+                    order_no, sorted(unparsed_keys),
+                )
+            return {"avg_fill_price": 0.0, "filled_qty": 0}
+
+        avg = total_amount_usd / total_qty
+        logger.info(
+            "US fill: %s avg=$%.4f qty=%d", order_no, avg, total_qty,
+        )
+        return {"avg_fill_price": float(avg), "filled_qty": total_qty}
 
     # ═════════════════════════════════════════════════════════════════
     # Cleanup
