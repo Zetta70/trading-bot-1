@@ -178,6 +178,9 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
     if portfolio.load_state():
         logger.info("KR: Resumed from saved state.")
 
+    # Patch 3: reconcile working capital with the broker before sizing bots.
+    await portfolio.sync_balance()
+
     for ticker in config.tickers_kr:
         await portfolio.add_bot(ticker)
 
@@ -249,6 +252,9 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
         bot_kwargs=bot_kwargs,
     )
 
+    # Patch 3: reconcile working capital (USD deposit -> KRW via FX).
+    await portfolio.sync_balance()
+
     for ticker in config.tickers_us:
         await portfolio.add_bot(ticker)
 
@@ -319,6 +325,28 @@ class _USClientAdapter:
     async def get_order_fill(self, order_no: str) -> dict:
         """Proxy to KISUSClient. Returns USD float ``avg_fill_price``."""
         return await self._us.get_order_fill(order_no)
+
+    async def get_balance(self) -> dict:
+        """
+        KISClient-shaped balance for the PortfolioManager.
+
+        The underlying call is ``KISUSClient.get_us_balance`` which
+        returns USD fields. This adapter converts the deposit and
+        eval totals to KRW using the cached FX rate so PortfolioManager
+        can compare against ``INITIAL_CASH`` (KRW) without knowing the
+        underlying market.
+        """
+        bal = await self._us.get_us_balance()
+        fx = float(self._us._cached_usdkrw or self._us.default_usdkrw or 1380.0)
+        deposit_usd = float(bal.get("deposit_usd", 0.0))
+        total_eval_usd = float(bal.get("total_eval_usd", 0.0))
+        return {
+            "deposit": int(deposit_usd * fx),
+            "deposit_usd": deposit_usd,
+            "total_eval": int(total_eval_usd * fx),
+            "fx_rate": fx,
+            "holdings": bal.get("holdings", []),
+        }
 
     async def close(self) -> None:
         await self._us.close()

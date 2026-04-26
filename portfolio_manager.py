@@ -59,6 +59,7 @@ class PortfolioManager:
         self.predictor = predictor
 
         self.initial_cash = initial_cash
+        self.env_initial_cash = initial_cash  # Patch 3: cap for sync
         self.max_drawdown_pct = max_drawdown_pct
         self.max_active_bots = max_active_bots
         self.scan_interval = scan_interval
@@ -69,6 +70,8 @@ class PortfolioManager:
         self._remaining_cash: int = initial_cash
         self._peak_equity: int = initial_cash
         self._running = False
+        self._last_sync_time: str | None = None  # ISO-8601, set by sync_balance
+        self._state_loaded = False  # set by load_state(), read by sync_balance
 
         # Bot registry
         self.bots: dict[str, TradingBot] = {}
@@ -246,6 +249,77 @@ class PortfolioManager:
                 f"Drawdown {drawdown:.2%} exceeds {self.max_drawdown_pct:.2%}"
             )
 
+    # ── Balance Sync (Patch 3) ───────────────────────────────────────
+
+    SYNC_TTL_HOURS = 24
+
+    async def sync_balance(self) -> None:
+        """
+        Reconcile bot working capital with the broker's actual deposit.
+
+        Contract:
+          * Calls ``client.get_balance()`` and reads ``deposit`` (KRW).
+          * Sets ``self.initial_cash = min(actual_krw, env_initial_cash)``.
+          * If no state was loaded, sets ``_remaining_cash`` to the new
+            initial_cash. If state WAS loaded, leaves ``_remaining_cash``
+            alone (its value reflects already-allocated capital).
+          * Stores ``last_sync_time`` (ISO-8601 KST). Skips the API call
+            if a previous sync is younger than ``SYNC_TTL_HOURS``.
+          * On any failure (network, missing field, etc.) falls back to
+            the .env value with a WARNING; never blocks startup.
+
+        Must be called after ``load_state()`` and before any ``add_bot()``.
+        """
+        # 24-hour TTL: skip the network call when state has a recent sync.
+        if self._last_sync_time:
+            try:
+                last = datetime.fromisoformat(self._last_sync_time)
+                age_hours = (
+                    datetime.now(KST) - last
+                ).total_seconds() / 3600
+                if age_hours < self.SYNC_TTL_HOURS:
+                    logger.info(
+                        "Account sync: skipped — last sync %.1fh ago "
+                        "(< %dh TTL)",
+                        age_hours, self.SYNC_TTL_HOURS,
+                    )
+                    return
+            except (ValueError, TypeError):
+                pass  # corrupted timestamp — fall through and re-sync
+
+        env_limit = self.env_initial_cash
+        try:
+            balance = await self.client.get_balance()
+            actual_krw = int(balance.get("deposit", 0))
+        except Exception as e:
+            logger.warning(
+                "Account sync failed: %s. Falling back to .env "
+                "INITIAL_CASH=%s KRW.",
+                e, f"{env_limit:,}",
+            )
+            return  # leave initial_cash / _remaining_cash unchanged
+
+        if actual_krw <= 0:
+            logger.warning(
+                "Account sync: broker reported deposit=%s KRW (zero or "
+                "missing). Falling back to .env INITIAL_CASH=%s KRW.",
+                f"{actual_krw:,}", f"{env_limit:,}",
+            )
+            return
+
+        new_initial = min(actual_krw, env_limit)
+        logger.info(
+            "Account sync: KIS balance=%s KRW, .env limit=%s KRW "
+            "→ using %s KRW",
+            f"{actual_krw:,}", f"{env_limit:,}", f"{new_initial:,}",
+        )
+        self.initial_cash = new_initial
+        self._peak_equity = max(self._peak_equity, new_initial)
+        if not self._state_loaded:
+            self._remaining_cash = new_initial
+            self._last_equity_for_return = new_initial
+        self._last_sync_time = datetime.now(KST).isoformat()
+
     # ── State Persistence ────────────────────────────────────────────
 
     def save_state(self) -> None:
@@ -254,6 +328,7 @@ class PortfolioManager:
             "remaining_cash": self._remaining_cash,
             "peak_equity": self._peak_equity,
             "total_equity": self.total_equity,
+            "last_sync_time": self._last_sync_time,
             "bots": {
                 ticker: bot.get_state()
                 for ticker, bot in self.bots.items()
@@ -279,6 +354,7 @@ class PortfolioManager:
             "remaining_cash", self.initial_cash,
         )
         self._peak_equity = state.get("peak_equity", self.initial_cash)
+        self._last_sync_time = state.get("last_sync_time")
 
         restored = 0
         for ticker, bot_state in state.get("bots", {}).items():
@@ -294,9 +370,11 @@ class PortfolioManager:
             restored += 1
 
         logger.info(
-            "State restored: %d bots, equity=%s KRW",
+            "State restored: %d bots, equity=%s KRW (last sync: %s)",
             restored, f"{self.total_equity:,}",
+            self._last_sync_time or "never",
         )
+        self._state_loaded = True
         return True
 
     # ── Concurrent Tasks ─────────────────────────────────────────────

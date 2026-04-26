@@ -433,11 +433,29 @@ class KISUSClient:
         total_eval = float(summary.get("TOT_EVLU_PFLS_AMT", "0"))
         total_pnl = float(summary.get("OVRS_TOT_PFLS", "0"))
 
+        # Patch 3: extract USD deposit (free cash) with tolerant field
+        # fallback — KIS overseas-balance keys vary by endpoint version.
+        deposit_usd = 0.0
+        for key in (
+            "FRCR_DNCA_TOT_AMT",      # 외화 예수금 총액
+            "FRCR_BUY_PSBL_AMT_1",    # 외화 매수가능금액
+            "FRCR_DRWG_PSBL_AMT_1",   # 외화 출금가능금액
+            "TOT_FRCR_CBLC_SMTL",     # 외화잔고합계
+        ):
+            v = summary.get(key)
+            if v not in (None, "", "."):
+                try:
+                    deposit_usd = float(v)
+                    break
+                except (ValueError, TypeError):
+                    continue
+
         logger.info(
-            "US 잔고: 평가=$%s, 손익=$%s, 종목수=%d",
-            f"{total_eval:,.2f}", f"{total_pnl:,.2f}", len(holdings),
+            "US 잔고: 예수금=$%.2f, 평가=$%.2f, 손익=$%.2f, 종목수=%d",
+            deposit_usd, total_eval, total_pnl, len(holdings),
         )
         return {
+            "deposit_usd": deposit_usd,
             "total_eval_usd": total_eval,
             "total_pnl_usd": total_pnl,
             "holdings": holdings,
