@@ -73,6 +73,14 @@ class PortfolioManager:
         self._last_sync_time: str | None = None  # ISO-8601, set by sync_balance
         self._state_loaded = False  # set by load_state(), read by sync_balance
 
+        # Patch 5: shared lock for *cash mutation only*. Not held across
+        # network awaits — ``await client.place_order()`` runs lock-free
+        # so concurrent bots don't serialize on each other.
+        self._cash_lock = asyncio.Lock()
+        # Make the lock available to every bot constructed via _bot_kwargs
+        # (both the seed-add_bot path and the load_state restoration path).
+        self._bot_kwargs.setdefault("cash_lock", self._cash_lock)
+
         # Bot registry
         self.bots: dict[str, TradingBot] = {}
         self._tasks: dict[str, asyncio.Task] = {}
@@ -157,12 +165,15 @@ class PortfolioManager:
             )
             return False
 
-        alloc = min(self._cash_per_bot(), self._remaining_cash)
-        if alloc <= 0:
-            logger.warning("No cash left to allocate for %s.", ticker)
-            return False
-
-        self._remaining_cash -= alloc
+        # Patch 5: cash-allocation race guard. Two concurrent add_bot
+        # calls without this lock could each see _remaining_cash=200_000,
+        # both subtract 200_000, and end up with -200_000.
+        async with self._cash_lock:
+            alloc = min(self._cash_per_bot(), self._remaining_cash)
+            if alloc <= 0:
+                logger.warning("No cash left to allocate for %s.", ticker)
+                return False
+            self._remaining_cash -= alloc
 
         bot = TradingBot(
             client=self.client,

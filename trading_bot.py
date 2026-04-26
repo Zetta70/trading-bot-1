@@ -29,6 +29,18 @@ from ohlcv_cache import get_cache
 # deprecation warning fires only on actual use.
 _QTY_UNSET = object()
 
+
+class _NullAsyncLock:
+    """No-op async lock for TradingBots constructed without a portfolio
+    (Patch 5). Lets ``async with bot._cash_lock_ctx():`` work uniformly
+    whether a real lock is plumbed through or not."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
 logger = logging.getLogger(__name__)
 trade_logger = logging.getLogger("trade")
 
@@ -81,6 +93,7 @@ class TradingBot:
         entry_mode: str = "eod",
         max_trades_per_day: int = 2,
         currency: str = "KRW",
+        cash_lock: asyncio.Lock | None = None,
     ):
         self.client = client
         self.ticker = ticker
@@ -112,6 +125,11 @@ class TradingBot:
             raise ValueError(
                 f"currency must be 'KRW' or 'USD', got {currency!r}"
             )
+        # Patch 5: shared cash-mutation lock from PortfolioManager. None
+        # means no concurrency protection (single-bot tests, legacy
+        # callers); a real Lock is plumbed through bot_kwargs in normal
+        # operation.
+        self.cash_lock = cash_lock
 
         # Price tracking. last_price/reference_price are stored in the
         # bot's native currency (USD float for US, KRW int for KR);
@@ -191,6 +209,18 @@ class TradingBot:
         if self.currency == "USD":
             return f"{float(p):.2f}"
         return f"{int(p):,}"
+
+    def _cash_lock_ctx(self):
+        """
+        Async context manager around cash mutations (Patch 5).
+
+        Returns the shared PortfolioManager lock when one is plumbed
+        through bot_kwargs; otherwise a no-op context manager so
+        single-bot tests / legacy callers still work without the lock.
+        """
+        if self.cash_lock is not None:
+            return self.cash_lock
+        return _NullAsyncLock()
 
     def _now_str(self) -> str:
         return datetime.now(KST).strftime("%Y-%m-%d %H:%M:%S")
@@ -515,28 +545,35 @@ class TradingBot:
 
             sell_tax = self.tax_kr if self.currency == "KRW" else self.tax_us
 
-            if side == "BUY":
-                cost_native = fill_price * qty_to_trade * (1 + self.commission)
-                cost_krw = int(cost_native * fx)
-                self.cash -= cost_krw
-                self.position += qty_to_trade
-                self._highest_since_entry = fill_price
-                if not self._entry_atr:
-                    self._entry_atr = fill_price * 0.02
-            else:
-                proceeds_native = (
-                    fill_price * qty_to_trade
-                    * (1 - self.commission - sell_tax)
-                )
-                proceeds_krw = int(proceeds_native * fx)
-                self.cash += proceeds_krw
-                # Always full liquidation on SELL.
-                self.position = 0
-                self._highest_since_entry = 0
-                self._entry_atr = 0.0
+            # Patch 5: serialize cash mutations across all bots. Lock is
+            # held only across pure sync arithmetic — no awaits inside —
+            # so concurrent bots aren't serialized on each other's
+            # network calls.
+            async with self._cash_lock_ctx():
+                if side == "BUY":
+                    cost_native = (
+                        fill_price * qty_to_trade * (1 + self.commission)
+                    )
+                    cost_krw = int(cost_native * fx)
+                    self.cash -= cost_krw
+                    self.position += qty_to_trade
+                    self._highest_since_entry = fill_price
+                    if not self._entry_atr:
+                        self._entry_atr = fill_price * 0.02
+                else:
+                    proceeds_native = (
+                        fill_price * qty_to_trade
+                        * (1 - self.commission - sell_tax)
+                    )
+                    proceeds_krw = int(proceeds_native * fx)
+                    self.cash += proceeds_krw
+                    # Always full liquidation on SELL.
+                    self.position = 0
+                    self._highest_since_entry = 0
+                    self._entry_atr = 0.0
 
-            self.reference_price = fill_price
-            self._trades_today += 1
+                self.reference_price = fill_price
+                self._trades_today += 1
 
             self._append_trade_csv(
                 side, price, fill_price, order_no, ml_score, qty_to_trade,
