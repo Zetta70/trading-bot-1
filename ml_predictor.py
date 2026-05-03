@@ -160,30 +160,43 @@ class MLPredictor:
         index_df: pd.DataFrame | None = None,
     ) -> str:
         """
-        Generate a trading signal using the LightGBM model.
+        Generate a trading signal ('BUY' / 'SELL' / 'HOLD').
 
-        Falls back to rule-based scoring if no ML model is loaded.
+        Thin wrapper around :py:meth:`predict_signal_with_prob` that
+        drops the probability. Public API preserved bit-for-bit so the
+        existing scanner / EOD evaluator code paths keep working.
+        """
+        signal, _ = self.predict_signal_with_prob(ohlcv_df, index_df)
+        return signal
 
-        Parameters
-        ----------
-        ohlcv_df : pd.DataFrame
-            OHLCV data with columns: open, high, low, close, volume.
-        index_df : pd.DataFrame, optional
-            KOSPI index data for market-context features.
+    def predict_signal_with_prob(
+        self,
+        ohlcv_df: pd.DataFrame,
+        index_df: pd.DataFrame | None = None,
+    ) -> tuple[str, float]:
+        """
+        Generate (signal, probability).
 
-        Returns
-        -------
-        str : 'BUY', 'SELL', or 'HOLD'
+        Used by Patch 7's live Kelly sizer, which needs the raw
+        probability — not just the BUY/SELL/HOLD label — to scale
+        position size with model conviction.
+
+        Probability semantics
+        ---------------------
+        * ML mode (loaded model): ``predict_proba`` output in [0, 1].
+        * Legacy fallback: rule-based bullish score in [0, 1] from
+          :py:meth:`score`.
+        * NaN-feature row → ('HOLD', 0.5). The 0.5 acts as a sentinel
+          meaning "no real signal" — the live Kelly sizer treats 0.5
+          as a do-not-size-by-Kelly marker (R5).
+
+        Never raises. On any internal exception, logs ERROR and falls
+        back to the legacy score path.
         """
         if self._ml_model is None:
-            # Fallback: use legacy score
             prices = ohlcv_df["close"].tolist()
-            s = self.score(prices)
-            if s >= self.threshold_buy:
-                return "BUY"
-            elif s <= self.threshold_sell:
-                return "SELL"
-            return "HOLD"
+            s = float(self.score(prices))
+            return self._signal_from_prob(s), s
 
         try:
             from features import add_features, feature_columns
@@ -192,10 +205,11 @@ class MLPredictor:
             features_df = add_features(ohlcv_df, index_df)
             cols = feature_columns(include_market=has_market)
 
-            # Use only the columns the model was trained on
             model_cols = self._ml_model.feature_names
             if model_cols:
-                available = [c for c in model_cols if c in features_df.columns]
+                available = [
+                    c for c in model_cols if c in features_df.columns
+                ]
             else:
                 available = [c for c in cols if c in features_df.columns]
 
@@ -210,29 +224,29 @@ class MLPredictor:
                     "ML inference skipped: NaN in features %s -> HOLD",
                     nan_cols,
                 )
-                return "HOLD"
+                return "HOLD", 0.5
 
-            prob = self._ml_model.predict_proba(latest)[0]
+            prob = float(self._ml_model.predict_proba(latest)[0])
             logger.info(
-                "ML inference: prob=%.4f, threshold_buy=%.2f, threshold_sell=%.2f",
+                "ML inference: prob=%.4f, threshold_buy=%.2f, "
+                "threshold_sell=%.2f",
                 prob, self.threshold_buy, self.threshold_sell,
             )
-
-            if prob >= self.threshold_buy:
-                return "BUY"
-            elif prob <= self.threshold_sell:
-                return "SELL"
-            return "HOLD"
+            return self._signal_from_prob(prob), prob
 
         except Exception as e:
             logger.error("ML prediction failed: %s. Falling back.", e)
             prices = ohlcv_df["close"].tolist()
-            s = self.score(prices)
-            if s >= self.threshold_buy:
-                return "BUY"
-            elif s <= self.threshold_sell:
-                return "SELL"
-            return "HOLD"
+            s = float(self.score(prices))
+            return self._signal_from_prob(s), s
+
+    def _signal_from_prob(self, prob: float) -> str:
+        """Threshold a probability into BUY / SELL / HOLD."""
+        if prob >= self.threshold_buy:
+            return "BUY"
+        if prob <= self.threshold_sell:
+            return "SELL"
+        return "HOLD"
 
     # ═══════════════════════════════════════════════════════════════
     # Internal: Legacy feature calculations

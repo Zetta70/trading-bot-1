@@ -202,6 +202,40 @@ class PortfolioManager:
         for task in self._tasks.values():
             task.cancel()
 
+    # ── Returns dict for live Kelly sizer (Patch 7) ──────────────────
+
+    def get_returns_dict(
+        self,
+        exclude_ticker: str | None = None,
+        lookback: int = 60,
+    ) -> dict:
+        """
+        Build a ``{ticker: pd.Series}`` map of recent daily returns for
+        every active bot, used by the live Kelly sizer's correlation
+        penalty.
+
+        * Source: each bot's ``_daily_ohlcv["close"].pct_change()`` —
+          already pre-fetched by ``_refresh_daily_data``, no I/O here.
+        * Excludes ``exclude_ticker`` so the candidate isn't compared
+          against itself.
+        * Skips bots whose daily OHLCV is missing or has fewer than 30
+          rows (correlation on too few points is misleading).
+        """
+        out: dict = {}
+        for ticker, bot in self.bots.items():
+            if ticker == exclude_ticker:
+                continue
+            df = getattr(bot, "_daily_ohlcv", None)
+            if df is None or len(df) < 30 or "close" not in df.columns:
+                continue
+            try:
+                rets = df["close"].pct_change().dropna().tail(lookback)
+            except Exception:
+                continue
+            if len(rets) >= max(20, lookback // 2):
+                out[ticker] = rets
+        return out
+
     # ── Market Hours ─────────────────────────────────────────────────
 
     def _is_market_open(self) -> bool:

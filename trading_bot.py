@@ -150,6 +150,10 @@ class TradingBot:
         self._ohlcv_cache = get_cache()
         self._last_ml_check: float = 0.0
         self._cached_ml_signal: str = "HOLD"
+        # Patch 7: cache the raw probability so the live Kelly sizer
+        # can read conviction without re-running inference. 0.5 is the
+        # "no real signal" sentinel — treated as a skip-Kelly marker.
+        self._cached_ml_prob: float = 0.5
 
         # Adaptive-threshold (Phase 1 EOD) state
         self.atr_period = 14
@@ -236,31 +240,50 @@ class TradingBot:
 
     def _get_ml_signal(self) -> str:
         """
-        Get ML signal based on daily OHLCV, cached for ML_CHECK_INTERVAL seconds.
+        Daily ML signal, cached for ``ML_CHECK_INTERVAL`` seconds.
 
-        Returns 'BUY', 'SELL', or 'HOLD'. Falls back to 'HOLD' on any error
-        so trades never depend on a silent inference failure.
+        Thin wrapper around :py:meth:`_get_ml_signal_with_prob` that
+        drops the probability. Existing callers (EOD evaluator, BUY
+        gate) keep the same signature and behavior.
+        """
+        signal, _ = self._get_ml_signal_with_prob()
+        return signal
+
+    def _get_ml_signal_with_prob(self) -> tuple[str, float]:
+        """
+        Daily ML (signal, probability), cached for the same TTL as
+        :py:meth:`_get_ml_signal`.
+
+        Probability is kept alongside the signal so Patch 7's live
+        Kelly sizer can read raw conviction without re-running inference
+        (which is expensive and racy with the once-per-hour refresh
+        cadence). ``0.5`` is the no-real-signal sentinel — populated
+        when daily OHLCV is missing/short or inference raised.
         """
         now = time.time()
         if now - self._last_ml_check < self.ML_CHECK_INTERVAL:
-            return self._cached_ml_signal
+            return self._cached_ml_signal, self._cached_ml_prob
 
         ohlcv = self._ohlcv_cache.get(self.ticker)
         if ohlcv is None or len(ohlcv) < 60:
             self._cached_ml_signal = "HOLD"
+            self._cached_ml_prob = 0.5
         else:
             try:
-                self._cached_ml_signal = self.predictor.predict_signal(ohlcv)
+                sig, prob = self.predictor.predict_signal_with_prob(ohlcv)
+                self._cached_ml_signal = sig
+                self._cached_ml_prob = float(prob)
             except Exception as e:
                 logger.warning("[%s] ML signal error: %s", self.ticker, e)
                 self._cached_ml_signal = "HOLD"
+                self._cached_ml_prob = 0.5
 
         self._last_ml_check = now
         logger.info(
-            "[%s] ML signal refreshed: %s",
-            self.ticker, self._cached_ml_signal,
+            "[%s] ML signal refreshed: %s (prob=%.4f)",
+            self.ticker, self._cached_ml_signal, self._cached_ml_prob,
         )
-        return self._cached_ml_signal
+        return self._cached_ml_signal, self._cached_ml_prob
 
     # ── Daily-bar EOD state ──────────────────────────────────────────
 
