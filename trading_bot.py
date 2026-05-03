@@ -94,6 +94,11 @@ class TradingBot:
         max_trades_per_day: int = 2,
         currency: str = "KRW",
         cash_lock: asyncio.Lock | None = None,
+        portfolio=None,                      # PortfolioManager | None
+        use_kelly_sizing: bool = True,
+        kelly_multiplier: float = 0.25,
+        target_portfolio_vol: float = 0.15,
+        kelly_max_weight: float = 0.10,
     ):
         self.client = client
         self.ticker = ticker
@@ -130,6 +135,16 @@ class TradingBot:
         # callers); a real Lock is plumbed through bot_kwargs in normal
         # operation.
         self.cash_lock = cash_lock
+
+        # Patch 7: back-reference to PortfolioManager for the live
+        # Kelly sizer (correlation penalty needs other bots' returns,
+        # vol target needs total portfolio equity). None disables
+        # Kelly and the bot falls back to Patch 2 cash-only sizing.
+        self._portfolio = portfolio
+        self._use_kelly_sizing = bool(use_kelly_sizing)
+        self._kelly_multiplier = float(kelly_multiplier)
+        self._target_portfolio_vol = float(target_portfolio_vol)
+        self._kelly_max_weight = float(kelly_max_weight)
 
         # Price tracking. last_price/reference_price are stored in the
         # bot's native currency (USD float for US, KRW int for KR);
@@ -495,13 +510,139 @@ class TradingBot:
 
         return None
 
+    # ── BUY Sizing (Patch 2 cash-only + Patch 7 Kelly) ───────────────
+
+    def _cost_per_share_krw(self, price, fx) -> float:
+        """
+        Effective per-share cost in KRW including the 0.1% slippage
+        buffer (so dynamic sizing doesn't get one share clipped at
+        fill time). Negative/zero result means malformed inputs;
+        callers must guard.
+        """
+        return price * (1 + self.commission + 0.001) * fx
+
+    def _size_buy_cash_only(self, price, fx) -> int:
+        """
+        Patch 2 sizing path: floor(cash * 0.95 / cost_per_share_krw).
+
+        Public-ish so the live Kelly path (Patch 7) can use it as a
+        fallback when Kelly prerequisites aren't met. Returns 0 on
+        any malformed input.
+        """
+        cps_krw = self._cost_per_share_krw(price, fx)
+        if cps_krw <= 0:
+            return 0
+        usable_cash_krw = int(self.cash * 0.95)
+        return int(usable_cash_krw // cps_krw)
+
+    def _size_buy_kelly(self, price, fx):
+        """
+        Kelly + vol target + correlation-penalty sizing for live BUY.
+
+        Returns int qty when all prerequisites are met, else None to
+        signal the caller to fall back to ``_size_buy_cash_only``.
+        Reasons for None are logged at INFO so the first weeks of
+        live runs are debuggable.
+        """
+        if not self._use_kelly_sizing:
+            logger.info(
+                "[%s] Kelly skipped: USE_KELLY_SIZING=false",
+                self.ticker,
+            )
+            return None
+        if self._portfolio is None:
+            logger.info(
+                "[%s] Kelly skipped: no portfolio reference (legacy "
+                "single-bot mode)",
+                self.ticker,
+            )
+            return None
+
+        _, prob = self._get_ml_signal_with_prob()
+        # 0.5 is the documented "no real model output" sentinel
+        # (NaN features, model unloaded, inference exception).
+        if abs(prob - 0.5) < 1e-9:
+            logger.info(
+                "[%s] Kelly skipped: ML prob at default 0.5 sentinel",
+                self.ticker,
+            )
+            return None
+
+        df = self._daily_ohlcv
+        if df is None or len(df) < 30 or "close" not in df.columns:
+            logger.info(
+                "[%s] Kelly skipped: insufficient daily OHLCV", self.ticker,
+            )
+            return None
+
+        try:
+            cand_returns = df["close"].pct_change().dropna().tail(60)
+            if len(cand_returns) < 20:
+                logger.info(
+                    "[%s] Kelly skipped: <20 valid daily returns",
+                    self.ticker,
+                )
+                return None
+            import math
+            vol = float(cand_returns.std() * math.sqrt(252))
+            if not (vol > 0) or vol != vol:  # 0 / negative / NaN
+                vol = 0.25
+
+            existing_returns = self._portfolio.get_returns_dict(
+                exclude_ticker=self.ticker, lookback=60,
+            )
+            equity_krw = float(self._portfolio.total_equity)
+
+            from position_sizer import compute_position_size
+            amount_krw, debug = compute_position_size(
+                portfolio_equity=equity_krw,
+                ml_probability=float(prob),
+                stock_annualized_vol=vol,
+                candidate_returns=cand_returns,
+                existing_returns=existing_returns,
+                kelly_multiplier=self._kelly_multiplier,
+                target_portfolio_vol=self._target_portfolio_vol,
+                max_weight=self._kelly_max_weight,
+                pt_atr_mult=2.0,
+                sl_atr_mult=1.0,
+            )
+        except Exception as e:
+            logger.warning(
+                "[%s] Kelly computation failed: %s. Falling back to "
+                "cash-only sizing.",
+                self.ticker, e,
+            )
+            return None
+
+        cps_krw = self._cost_per_share_krw(price, fx)
+        if cps_krw <= 0:
+            return None
+        qty = int(amount_krw // cps_krw)
+
+        # Defense in depth: never let Kelly say more than cash can
+        # actually fund. The portfolio-level lock + per-bot cash
+        # carve-outs make this rare, but if a manual reconfig drops
+        # cash we still want to be safe.
+        max_qty_by_cash = int(self.cash * 0.95 // cps_krw)
+        qty_capped = min(qty, max_qty_by_cash)
+
+        logger.info(
+            "[%s] BUY sizing: kelly path, prob=%.3f, vol=%.2f, "
+            "kelly_w=%.4f, vol_w=%.4f, corr_mult=%.2f, final_w=%.4f, "
+            "amount=%d KRW → qty=%d (cash-cap=%d)",
+            self.ticker, prob, vol,
+            debug.get("kelly_w", 0), debug.get("vol_w", 0),
+            debug.get("corr_mult", 0), debug.get("final_w", 0),
+            int(amount_krw), qty_capped, max_qty_by_cash,
+        )
+
+        return qty_capped if qty_capped >= 1 else None
+
     # ── Order Execution ──────────────────────────────────────────────
 
     async def _execute(self, side: str, price) -> None:
-        # ── Decide qty BEFORE placing the order (Patch 2) ────────
-        # BUY:  size to ~95% of cash (5% buffer for cost/slippage drift),
-        #       refuse to add to an existing position (no averaging up).
-        # SELL: full liquidation — sell whatever position exists.
+        # BUY: try Kelly sizing first; fall back to cash-only if any
+        # prerequisite is missing. SELL: always full liquidation.
         fx = self._fx_to_krw()  # 1.0 for KRW bots
 
         if side == "BUY":
@@ -513,24 +654,29 @@ class TradingBot:
                 )
                 return
 
-            usable_cash_krw = int(self.cash * 0.95)
-            # Slippage buffer (0.1%) so the request doesn't get clipped
-            # at fill time to one share less than we expected.
-            cost_per_share_native = price * (1 + self.commission + 0.001)
-            cost_per_share_krw = cost_per_share_native * fx
-            if cost_per_share_krw <= 0:
+            cps_krw = self._cost_per_share_krw(price, fx)
+            if cps_krw <= 0:
                 logger.warning(
                     "[%s] BUY skipped: invalid cost-per-share %.2f",
-                    self.ticker, cost_per_share_krw,
+                    self.ticker, cps_krw,
                 )
                 return
 
-            qty_to_trade = int(usable_cash_krw // cost_per_share_krw)
+            kelly_qty = self._size_buy_kelly(price, fx)
+            if kelly_qty is not None:
+                qty_to_trade = kelly_qty
+            else:
+                qty_to_trade = self._size_buy_cash_only(price, fx)
+                logger.info(
+                    "[%s] BUY sizing: cash_only fallback → qty=%d",
+                    self.ticker, qty_to_trade,
+                )
+
             if qty_to_trade < 1:
                 logger.info(
-                    "[%s] BUY skipped: insufficient cash "
+                    "[%s] BUY skipped: insufficient cash / size <= 0 "
                     "(have=%d KRW, need ~%d KRW for 1 share)",
-                    self.ticker, self.cash, int(cost_per_share_krw),
+                    self.ticker, self.cash, int(cps_krw),
                 )
                 return
         else:  # SELL

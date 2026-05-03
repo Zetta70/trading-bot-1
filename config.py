@@ -134,6 +134,12 @@ class Config:
         self.target_portfolio_vol: float = float(
             os.getenv("TARGET_PORTFOLIO_VOL", "0.15")
         )
+        # Patch 7: per-bot upper bound on weight in the live Kelly
+        # sizer. Matches the simulator's max_weight=0.10 default so
+        # backtest assumptions and live execution agree.
+        self.kelly_max_weight: float = float(
+            os.getenv("KELLY_MAX_WEIGHT", "0.10")
+        )
         self.max_sector_exposure: float = float(
             os.getenv("MAX_SECTOR_EXPOSURE", "0.30")
         )

@@ -161,6 +161,11 @@ async def run_kr_session(config: Config, stop_event: asyncio.Event) -> None:
         "entry_mode": config.entry_mode,
         "max_trades_per_day": config.max_trades_per_day,
         "currency": "KRW",
+        # Patch 7 — live Kelly sizer config
+        "use_kelly_sizing": config.use_kelly_sizing,
+        "kelly_multiplier": config.kelly_multiplier,
+        "target_portfolio_vol": config.target_portfolio_vol,
+        "kelly_max_weight": config.kelly_max_weight,
     }
 
     portfolio = PortfolioManager(
@@ -238,6 +243,11 @@ async def run_us_session(config: Config, stop_event: asyncio.Event) -> None:
         "entry_mode": config.entry_mode,
         "max_trades_per_day": config.max_trades_per_day,
         "currency": "USD",
+        # Patch 7 — live Kelly sizer config
+        "use_kelly_sizing": config.use_kelly_sizing,
+        "kelly_multiplier": config.kelly_multiplier,
+        "target_portfolio_vol": config.target_portfolio_vol,
+        "kelly_max_weight": config.kelly_max_weight,
     }
 
     portfolio = PortfolioManager(

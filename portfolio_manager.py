@@ -86,6 +86,11 @@ class PortfolioManager:
         # (both the seed-add_bot path and the load_state restoration path).
         self._bot_kwargs.setdefault("cash_lock", self._cash_lock)
 
+        # Patch 7: bots need a back-reference for the live Kelly sizer
+        # (reads other bots' returns + total equity). setdefault means
+        # callers can override with a custom proxy in tests.
+        self._bot_kwargs.setdefault("portfolio", self)
+
         # Bot registry
         self.bots: dict[str, TradingBot] = {}
         self._tasks: dict[str, asyncio.Task] = {}
